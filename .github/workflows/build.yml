@@ -1,0 +1,71 @@
+name: Build KernelSU-Next kernel (OnePlus 8T)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_tag:
+        description: 'KernelSU-Next tag（留空=最新）'
+        required: false
+        default: ''
+      jobs:
+        description: '并行编译数'
+        required: false
+        default: '4'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 释放磁盘空间（构建约需 40GB）
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git make bc bison flex unzip curl python3 \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libssl-dev
+
+      - name: 编译内核（只出 Image，封装在本地做）
+        env:
+          KSU_TAG: ${{ inputs.ksu_tag }}
+          JOBS: ${{ inputs.jobs }}
+          WORK: ${{ runner.temp }}/kbuild
+        run: |
+          chmod +x build_kernel.sh
+          ./build_kernel.sh 2>&1 | tee build.log
+
+      - name: 汇总产物
+        if: always()
+        run: |
+          echo "===== 内核版本 ====="
+          grep -a -o "Linux version 4\.19\.[0-9]*-perf[^\"]\{0,40\}" kernel_Image 2>/dev/null | head -2 || true
+          ls -lh kernel_Image 2>/dev/null || true
+
+      - name: 上传内核镜像
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-Image
+          path: kernel_Image
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: 上传构建日志（失败排查用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 7
