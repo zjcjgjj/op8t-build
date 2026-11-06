@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       ksu_tag:
-        description: 'KernelSU-Next tag（留空=最新）'
+        description: 'KernelSU-Next tag（4.19 非 GKI 用 v3.4.0-legacy）'
         required: false
-        default: ''
+        default: 'v3.4.0-legacy'
       jobs:
         description: '并行编译数'
         required: false
@@ -34,6 +34,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git make bc bison flex unzip curl python3 \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libssl-dev
+          # LLVM 官方 tarball 是 Ubuntu 16.04 构建，需要 libtinfo5 才能运行
+          sudo apt-get install -y libtinfo5 || sudo apt-get install -y libncurses5 || true
+          clang --version 2>/dev/null || echo "系统 clang 未安装（用下载的工具链）"
 
       - name: 编译内核（只出 Image，封装在本地做）
         env:
