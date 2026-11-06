@@ -159,18 +159,74 @@ for root, dirs, files in os.walk('.'):
                 n += 1
 print('  cleaned %d kconfig file(s)' % n)
 
-left = []
+# OSS 仓库里 block/blk、block/uxio_first、kernel/sched_assist、kernel/tuning、kernel/uad
+# 都是指向 vendor/oplus/kernel/oplus_performance/... 的 symlink，独立 clone 后是断链。
+# 一旦 Kconfig 里 source 到它们（有的还没被 #ifdef 包住，如 block/Kconfig:249），
+# kconfig 会 fatal 退出。这里把指向不存在文件的 source 行注释掉。
+SRC_A = re.compile(r'^(\s*)source\s+"([^"]+)"\s*$')
+SRC_B = re.compile(r'^(\s*)source\s+(\S+)\s*$')
+
+def fix_sources():
+    changed = 0
+    for root, dirs, files in os.walk('.'):
+        dirs[:] = [d for d in dirs if d != '.git']
+        for f in files:
+            if not (f == 'Kconfig' or f.endswith('.kconfig')):
+                continue
+            p = os.path.join(root, f)
+            try:
+                lines = open(p, encoding='utf-8', errors='replace').readlines()
+            except OSError:
+                continue
+            out, hit = [], False
+            for line in lines:
+                if line.lstrip().startswith('#'):
+                    out.append(line); continue
+                m = SRC_A.match(line) or SRC_B.match(line)
+                if m:
+                    tgt = m.group(2)
+                    cands = [tgt, os.path.normpath(os.path.join(root, tgt))]
+                    if not any(os.path.isfile(c) for c in cands):
+                        out.append('%s# [skip] dangling source: %s\n' % (m.group(1), tgt))
+                        hit = True
+                        continue
+                out.append(line)
+            if hit:
+                open(p, 'w', encoding='utf-8').write(''.join(out))
+                changed += 1
+    return changed
+
+print('  fixed %d kconfig with dangling source' % fix_sources())
+
+# Makefile 里 obj-y += blk/ 这类指向不存在目录的条目同样会让 kbuild 直接报错，
+# 只处理「整行所有目录都不存在」的情况，避免误伤。
+MK = re.compile(r'^(\s*)obj-[^\s]+\s*(?:\+=|=)\s*(.*)$')
+mk_fixed = 0
 for root, dirs, files in os.walk('.'):
     dirs[:] = [d for d in dirs if d != '.git']
-    for f in files:
-        if f == 'Kconfig':
-            p = os.path.join(root, f)
-            with open(p, encoding='utf-8', errors='replace') as fh:
-                for i, line in enumerate(fh, 1):
-                    if DIRECTIVE.match(line):
-                        left.append('%s:%d' % (p, i))
-if left:
-    print('  WARN 残留指令:', left[:5])
+    if 'Makefile' not in files:
+        continue
+    p = os.path.join(root, 'Makefile')
+    try:
+        lines = open(p, encoding='utf-8', errors='replace').readlines()
+    except OSError:
+        continue
+    out, hit = [], False
+    for line in lines:
+        if line.lstrip().startswith('#'):
+            out.append(line); continue
+        m = MK.match(line)
+        if m:
+            subs = [t for t in m.group(2).split() if t.endswith('/')]
+            if subs and not any(os.path.isdir(os.path.join(root, s.rstrip('/'))) for s in subs):
+                out.append('%s# [skip] missing dir: %s\n' % (m.group(1), ' '.join(subs)))
+                hit = True
+                continue
+        out.append(line)
+    if hit:
+        open(p, 'w', encoding='utf-8').write(''.join(out))
+        mk_fixed += 1
+print('  fixed %d Makefile with missing dir' % mk_fixed)
 PYEOF
 
 log "生成 defconfig: $DEFCONFIG"
