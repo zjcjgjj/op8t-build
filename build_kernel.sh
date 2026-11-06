@@ -111,6 +111,68 @@ ls -l kernelsu | sed 's/^/    /'
 
 # ---------------------------------------------------------------- 5. 配置内核
 cd "$WORK/kernel"
+
+# 一加 OSS 源码在 Kconfig 里直接写了 C 预处理器指令（如 init/Kconfig 的
+#   #ifdef OPLUS_FEATURE_SCHED_ASSIST
+#   source "kernel/sched_assist/Kconfig"
+#   #endif
+# ），标准 kconfig 解析器不认识 #ifdef，会报 unexpected/invalid option；
+# 且 sched_assist/tuning/uad 这些目录在本分支里只是几十字节的占位文件（源码未开源）。
+# 官方构建时这些宏同样未定义 → 这里按"未定义"剔除整块，等价还原官方行为。
+log "预处理 Kconfig 中的 #ifdef 块"
+python3 - <<'PYEOF'
+import os, re
+DIRECTIVE = re.compile(r'^(\s*)#\s*(ifdef|ifndef|endif|else|elif)\b')
+
+def strip(path):
+    keep, out, hit = [], [], False
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            m = DIRECTIVE.match(line)
+            if m:
+                hit = True
+                d = m.group(2)
+                if d == 'ifdef':
+                    keep.append(False)          # 宏未定义 → 丢弃
+                elif d == 'ifndef':
+                    keep.append(True)           # 宏未定义 → 保留
+                elif d == 'elif':
+                    if keep: keep[-1] = False
+                elif d == 'else':
+                    if keep: keep[-1] = not keep[-1]
+                elif d == 'endif':
+                    if keep: keep.pop()
+                continue
+            if all(keep):
+                out.append(line)
+    if hit:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.writelines(out)
+    return hit
+
+n = 0
+for root, dirs, files in os.walk('.'):
+    dirs[:] = [d for d in dirs if d != '.git']
+    for f in files:
+        if f == 'Kconfig' or f.endswith('.kconfig'):
+            if strip(os.path.join(root, f)):
+                n += 1
+print('  cleaned %d kconfig file(s)' % n)
+
+left = []
+for root, dirs, files in os.walk('.'):
+    dirs[:] = [d for d in dirs if d != '.git']
+    for f in files:
+        if f == 'Kconfig':
+            p = os.path.join(root, f)
+            with open(p, encoding='utf-8', errors='replace') as fh:
+                for i, line in enumerate(fh, 1):
+                    if DIRECTIVE.match(line):
+                        left.append('%s:%d' % (p, i))
+if left:
+    print('  WARN 残留指令:', left[:5])
+PYEOF
+
 log "生成 defconfig: $DEFCONFIG"
 make ARCH=arm64 O=out "$DEFCONFIG"
 

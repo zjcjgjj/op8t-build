@@ -44,6 +44,7 @@ jobs:
           JOBS: ${{ inputs.jobs }}
           WORK: ${{ runner.temp }}/kbuild
         run: |
+          set -o pipefail   # 否则脚本失败会被 tee 的退出码掩盖
           chmod +x build_kernel.sh
           ./build_kernel.sh 2>&1 | tee build.log
 
