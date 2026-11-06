@@ -230,7 +230,43 @@ print('  fixed %d Makefile with missing dir' % mk_fixed)
 PYEOF
 
 log "生成 defconfig: $DEFCONFIG"
-make ARCH=arm64 O=out "$DEFCONFIG"
+# 必须显式带 CC=clang：init/Kconfig 里有
+#   default $(shell,$(srctree)/scripts/gcc-version.sh -p $(CC) | sed 's/^0*//') if CC_IS_GCC
+# kconfig 的 $(shell,...) 从环境变量取 $(CC)，命令行变量才会进 environ；
+# 不传则 $(CC) 为空 → 命令失败 → 展开成空值 → "default" 没值 → syntax error。
+KMAKE_ARGS="CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-"
+if ! make ARCH=arm64 O=out $KMAKE_ARGS "$DEFCONFIG"; then
+  log "defconfig 仍失败 → 改写 init/Kconfig 的 \$(shell,...)/\$(success,...) 后重试"
+  python3 - <<'PYEOF'
+import re
+p = 'init/Kconfig'
+t = open(p, encoding='utf-8', errors='replace').read()
+BOOL_FUNCS = ('success', 'cc-option', 'ld-option', 'as-option',
+              'gcc-min-version', 'clang-min-version')
+out, i, n = [], 0, len(t)
+while i < n:
+    if t.startswith('$(', i):
+        j, depth = i + 2, 1
+        while j < n and depth:
+            if t[j] == '(':
+                depth += 1
+            elif t[j] == ')':
+                depth -= 1
+            j += 1
+        if depth == 0:
+            name = t[i + 2:j - 1].split(',', 1)[0].strip()
+            if name in BOOL_FUNCS:
+                out.append('n'); i = j; continue
+            if name == 'shell':
+                out.append('0'); i = j; continue
+    out.append(t[i]); i += 1
+new = ''.join(out)
+new = new.replace('def_bool 0', 'def_bool n').replace('def_bool n if', 'def_bool n')
+open(p, 'w', encoding='utf-8').write(new)
+print('  init/Kconfig 已改写')
+PYEOF
+  make ARCH=arm64 O=out $KMAKE_ARGS "$DEFCONFIG"
+fi
 
 log "打开 KernelSU 相关选项 / 处理厂商模块兼容性"
 CFG="out/.config"
@@ -259,7 +295,7 @@ set_cfg CONFIG_KSU_SYSCALL_TABLE_HOOK y
 set_cfg CONFIG_MODULE_SIG_FORCE n
 set_cfg CONFIG_MODULE_SIG n
 set_cfg CONFIG_MODVERSIONS n
-make ARCH=arm64 O=out olddefconfig
+make ARCH=arm64 O=out $KMAKE_ARGS olddefconfig
 
 grep -E "^CONFIG_(KSU|KPROBES|KALLSYMS_ALL|MODVERSIONS|MODULE_SIG)" out/.config || true
 
