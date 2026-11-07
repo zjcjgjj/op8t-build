@@ -655,10 +655,35 @@ if [ "${USE_CCACHE:-1}" = "1" ] && command -v ccache >/dev/null 2>&1; then
   echo "  ccache 已启用：$CCACHE_DIR"
 fi
 T0=$(date +%s)
-make -j"$JOBS" ARCH=arm64 O=out \
-  CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-  KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
-  Image
+# ---------------------------------------------------------------------------
+# CONFIG_MODVERSIONS=y 会给每个导出符号生成 __crc_*（放在 .data），
+# GNU ld.bfd 在 vmlinux 的 PIE/shared 链接下对 R_AARCH64_ABS32 报：
+#   "dangerous relocation: unsupported relocation"
+# 官方 AOSP 用 ld.lld 链接，不会触发。这里 lld 优先，失败则自动回退
+# GNU ld + LDFLAGS_vmlinux=-z notext（允许该重定位）。
+# 两种尝试都在同一轮 workflow 内完成，第二次是增量链接、只需几十秒。
+# ---------------------------------------------------------------------------
+LINK_OK=0
+if command -v ld.lld >/dev/null 2>&1; then
+  log "链接器：ld.lld（LLVM，规避 __crc_* 的 ABS32 重定位）"
+  if make -j"$JOBS" ARCH=arm64 O=out \
+      CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+      LD=ld.lld KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
+      Image; then
+    LINK_OK=1
+  else
+    warn "ld.lld 链接失败，自动回退 GNU ld + -z notext（增量重链）"
+  fi
+else
+  warn "未找到 ld.lld，直接使用 GNU ld + -z notext"
+fi
+if [ "$LINK_OK" != "1" ]; then
+  log "链接器：GNU ld + LDFLAGS_vmlinux=\"-z notext\""
+  make -j"$JOBS" ARCH=arm64 O=out \
+    CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+    LDFLAGS_vmlinux="-z notext" KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
+    Image
+fi
 log "编译完成，耗时 $(( $(date +%s) - T0 )) 秒"
 if command -v ccache >/dev/null 2>&1; then ccache -s 2>/dev/null | head -8 || true; fi
 
