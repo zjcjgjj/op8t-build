@@ -678,10 +678,13 @@ else
   warn "未找到 ld.lld，直接使用 GNU ld + -z notext"
 fi
 if [ "$LINK_OK" != "1" ]; then
-  log "链接器：GNU ld + LDFLAGS_vmlinux=\"-z notext\""
+  # 不覆盖 LDFLAGS_vmlinux（内核 Makefile 会用它拼必要的链接选项，
+  # 命令行赋值会让 makefile 里的 += 全部失效），改为把 -z notext 直接
+  # 附加到链接器命令上，原有参数一个不少。
+  log '链接器：GNU ld + "-z notext"（允许 __crc_* 的 ABS32 重定位）'
   make -j"$JOBS" ARCH=arm64 O=out \
     CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-    LDFLAGS_vmlinux="-z notext" KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
+    LD="aarch64-linux-gnu-ld -z notext" KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
     Image
 fi
 log "编译完成，耗时 $(( $(date +%s) - T0 )) 秒"
