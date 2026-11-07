@@ -36,6 +36,10 @@ log "===== 依赖检查 ====="
 for c in git make python3 bc bison flex unzip curl tar; do
   command -v "$c" >/dev/null || { echo "[FAIL] 缺少 $c"; exit 1; }
 done
+command -v aarch64-linux-gnu-as >/dev/null || {
+  echo "[FAIL] 缺少 aarch64-linux-gnu-as（apt install binutils-aarch64-linux-gnu）"
+  echo "       否则汇编会误用主机 x86 的 as，报 unrecognized option '-EL'"
+  exit 1; }
 
 # ------------------------------------------------------------------ 1. 源码
 log "===== 克隆内核树 $KERNEL_BRANCH ====="
@@ -134,7 +138,22 @@ grep -c "^CONFIG_OPLUS_" out/.config | sed 's/^/  CONFIG_OPLUS_* 数量: /'
 
 # --------------------------------------------------------------- 5. 编译
 log "===== 编译 Image（-j$JOBS）====="
-make -j"$JOBS" O=out $KMAKE Image 2>&1 | tail -40
+set +e
+make -j"$JOBS" O=out $KMAKE Image > "$OUT/_img_$PHASE.log" 2>&1
+RC=$?
+set -e
+tail -25 "$OUT/_img_$PHASE.log"
+if [ $RC -ne 0 ]; then
+  if grep -qiE "relocation .*__crc|recompile with -fPIC|dangerous relocation" "$OUT/_img_$PHASE.log"; then
+    log "  bfd 链接器报 __crc 重定位错误 → 改用 ld.lld 重试"
+    make -j"$JOBS" O=out $KMAKE LD=ld.lld Image > "$OUT/_img2_$PHASE.log" 2>&1 || {
+      tail -40 "$OUT/_img2_$PHASE.log"; echo "[FAIL] ld.lld 重试仍失败"; exit 1; }
+    tail -15 "$OUT/_img2_$PHASE.log"
+  else
+    echo "[FAIL] 编译 Image 失败，完整日志见 _img_$PHASE.log"
+    exit 1
+  fi
+fi
 log "===== 编译 dtb / dtbo ====="
 make -j"$JOBS" O=out $KMAKE dtbs 2>&1 | tail -15 || log "  dtbs 目标失败，尝试直接构建 dtb"
 make -j"$JOBS" O=out $KMAKE arch/arm64/boot/dtb 2>&1 | tail -10 || true
