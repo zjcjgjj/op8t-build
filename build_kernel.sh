@@ -67,8 +67,46 @@ else
   log "私有模块源码已存在，跳过"
 fi
 cd "$WORK/kernel"
+
+# 一加的 symlink 是按完整 AOSP 树层级写的（如
+#   include/linux/sched_assist -> ../../../../vendor/oplus/... 
+#   kernel/sched_assist        -> ../../../vendor/oplus/...
+# ），独立 clone 出来的树浅两级 → 全部断链。
+# 这里统一按 vendor/... 真实位置重连，不再依赖原始相对层级。
+log "重连指向 vendor/ 的断链 symlink"
+python3 - <<'PYEOF'
+import os, re
+ROOT = os.getcwd()
+fixed, failed = 0, []
+for base, dirs, files in os.walk(ROOT):
+    if '.git' in dirs:
+        dirs.remove('.git')
+    for name in list(dirs) + list(files):
+        p = os.path.join(base, name)
+        if not os.path.islink(p) or os.path.exists(p):
+            continue
+        tgt = os.readlink(p).rstrip('/')
+        m = re.search(r'vendor/(?:oplus|qcom)/.*$', tgt)
+        if not m:
+            continue
+        new = os.path.join(ROOT, m.group(0))
+        if os.path.exists(new):
+            os.unlink(p)
+            os.symlink(os.path.relpath(new, os.path.dirname(p)), p)
+            fixed += 1
+        else:
+            failed.append('%s -> %s' % (os.path.relpath(p, ROOT), m.group(0)))
+print('  重连 %d 个断链 symlink' % fixed)
+for f in failed[:8]:
+    print('  仍未解析:', f)
+PYEOF
+
 if [ ! -f include/linux/sched_assist/sched_assist_locking.h ]; then
-  echo "私有头文件未就位（sched_assist_locking.h）—— 中止"; exit 1
+  echo "===== 诊断：私有头文件未就位 ====="
+  ls -ld vendor vendor/oplus/kernel/oplus_performance 2>&1 || true
+  readlink include/linux/sched_assist 2>&1 || true
+  find "$WORK/kernel" -name 'sched_assist_locking.h' 2>/dev/null | head -3
+  echo "中止"; exit 1
 fi
 log "私有模块源码就位：$(find vendor/oplus/kernel/oplus_performance -maxdepth 1 -type d | wc -l) 个目录"
 ls -l kernel/sched_assist block/blk include/linux/sched_assist | sed 's/^/    /'
