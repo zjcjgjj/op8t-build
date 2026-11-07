@@ -11,6 +11,10 @@ on:
         description: '并行编译数（留空=自动 nproc）'
         required: false
         default: ''
+      only_phase:
+        description: '留空/all=三阶段全跑；base|syscall|manual=只跑该阶段（修补丁后快速重编）'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -77,6 +81,7 @@ jobs:
       # 顺序固定：base 必须先跑（源码未被官方 Kbuild 的自动 backport 污染）
       # syscall 其次，manual 最后（会打五处源码补丁 + 摘掉 syscall 强制块）
       - name: 阶段 1/3 空白对照内核（官方 wiki 第一条前提）
+        if: ${{ inputs.only_phase == '' || inputs.only_phase == 'all' || inputs.only_phase == 'base' }}
         continue-on-error: true
         env:
           PHASE: base
@@ -94,6 +99,7 @@ jobs:
           cp kernel_wiki_base wiki_out/ 2>/dev/null || true
 
       - name: 阶段 2/3 KSU-Next + syscall table hook（Kconfig 指定 4.17+ non-GKI）
+        if: ${{ inputs.only_phase == '' || inputs.only_phase == 'all' || inputs.only_phase == 'syscall' }}
         continue-on-error: true
         env:
           PHASE: syscall
@@ -111,6 +117,7 @@ jobs:
           cp kernel_wiki_syscall wiki_out/ 2>/dev/null || true
 
       - name: 阶段 3/3 KSU-Next + 官方 wiki manual hook（五处源码补丁）
+        if: ${{ inputs.only_phase == '' || inputs.only_phase == 'all' || inputs.only_phase == 'manual' }}
         continue-on-error: true
         env:
           PHASE: manual

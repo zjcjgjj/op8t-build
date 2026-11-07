@@ -58,11 +58,18 @@ PATCHES = [
             '\t\t\t\tint *mode, int *flags);\n'
             '#endif\n'
         ),
+        # 4.19 的 fs/open.c 里有多处 `unsigned int lookup_flags =
+        # LOOKUP_FOLLOW;`，第一处在 do_faccessat 之前（第 131 行附近），
+        # 插到那里会因 dfd/filename/mode 未定义直接编译失败。
+        # 因此第一候选必须用 scope 把搜索范围限定在 do_faccessat 之内。
         anchors=[
             (r'^\s*unsigned int lookup_flags\s*=\s*LOOKUP_FOLLOW\s*;', 'after',
-             '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n'),
-            (r'^\s*long do_faccessat\s*\(', 'body',
-             '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n'),
+             '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n',
+             r'\bdo_faccessat\s*\('),
+            (r'^SYSCALL_DEFINE3\(faccessat,', 'body',
+             '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n', None),
+            (r'^\s*(?:long|int)\s+do_faccessat\s*\(', 'body',
+             '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n', None),
         ],
     ),
     dict(
@@ -138,10 +145,11 @@ def insert_decl(src, decl):
     return ''.join(lines[:last + 1]) + '\n' + decl + '\n' + ''.join(lines[last + 1:])
 
 
-def insertion_point(src, m, mode):
-    """返回插入位置（字符偏移），保证落在一个完整行的边界上。"""
-    line_start = src.rfind('\n', 0, m.start()) + 1
-    line_end = src.find('\n', m.end())
+def insertion_point(src, start, end, mode):
+    """返回插入位置（字符偏移），保证落在一个完整行的边界上。
+    start/end 是锚点在 src 中的全局偏移。"""
+    line_start = src.rfind('\n', 0, start) + 1
+    line_end = src.find('\n', end)
     if line_end < 0:
         line_end = len(src)
     if mode == 'before':
@@ -149,11 +157,11 @@ def insertion_point(src, m, mode):
     if mode == 'after':
         return line_end + 1 if line_end < len(src) else line_end
     if mode == 'body':
-        # 函数签名可能跨多行：从锚点匹配结束处往后找第一个单独 '{' 行
-        bm = re.search(r'^\s*\{\s*$', src[m.end():], re.M)
+        # 函数签名可能跨多行：从锚点结束处往后找第一个单独 '{' 行
+        bm = re.search(r'^\s*\{\s*$', src[end:], re.M)
         if not bm:
             return None
-        pos = m.end() + bm.end()
+        pos = end + bm.end()
         nxt = src.find('\n', pos)
         return (nxt + 1) if nxt >= 0 else len(src)
     return None
@@ -170,19 +178,29 @@ def patch_one(p):
         return True
 
     chosen = None
-    for regex, mode, call in p['anchors']:
-        m = re.search(regex, src, re.M)
+    for item in p['anchors']:
+        regex, mode, call = item[:3]
+        scope = item[3] if len(item) > 3 else None
+        base = 0
+        if scope:
+            sm = re.search(scope, src, re.M)
+            if not sm:
+                continue
+            base = sm.start()
+        m = re.search(regex, src[base:], re.M)
         if not m:
             continue
-        pos = insertion_point(src, m, mode)
+        gstart, gend = base + m.start(), base + m.end()
+        pos = insertion_point(src, gstart, gend, mode)
         if pos is None:
             continue
-        chosen = (m, mode, call, pos, regex)
+        chosen = (mode, call, pos, regex, gstart)
         break
     if not chosen:
         print('  [FAIL] %-24s 找不到可用锚点；候选：' % p['file'])
-        for r, md, _ in p['anchors']:
-            print('           [%s] %s' % (md, r))
+        for item in p['anchors']:
+            print('           [%s] %s%s' % (item[1], item[0],
+                  '  scope=' + item[3] if len(item) > 3 and item[3] else ''))
         for l in src.splitlines():
             if any(k in l for k in ('do_execveat_common', '__do_execve_file',
                                     'do_faccessat', 'SYSCALL_DEFINE3(read',
@@ -191,7 +209,7 @@ def patch_one(p):
                 print('           实际源码: ' + l.strip()[:120])
         return False
 
-    m, mode, call, pos, regex = chosen
+    mode, call, pos, regex, gstart = chosen
     if0, end0 = src.count('#ifdef CONFIG_KSU'), src.count('#endif')
     ins = '#ifdef CONFIG_KSU\n' + call + '#endif\n'
     src = src[:pos] + ins + src[pos:]
