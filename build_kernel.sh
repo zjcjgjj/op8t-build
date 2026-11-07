@@ -158,6 +158,17 @@ for d in $(find "$WORK/kernel/techpack" "$WORK/kernel/kernel/msm-4.19/techpack" 
 done
 echo "  补充头文件搜索路径: $(echo "$EXTRA_INC" | wc -w) 个"
 
+# 高通 RTIC 用 __rticdata 把 selinux_state 放进 .bss.rtic 段；
+# GNU ld 链接 vmlinux 时对该段做 ADRP 重定位会报
+#   relocation truncated to fit: R_AARCH64_ADR_PREL_PG_HI21
+# （官方构建用 ld.lld 不会触发）。去掉段属性让它回到普通 .bss，
+# 仅少一层内存加固，不影响 SELinux 功能与 root。
+if grep -q '__rticdata.*bss.rtic' include/linux/init.h; then
+  sed -i 's|#define __rticdata.*|#define __rticdata|' include/linux/init.h
+  log "已禁用 .bss.rtic 段属性（规避 GNU ld 重定位溢出）"
+  grep -n '__rticdata' include/linux/init.h | head -2
+fi
+
 # ---------------------------------------------------------------- 2. 工具链
 # 官方镜像 version 串为 clang 10.0.7 → 用 LLVM 10.0.1 官方发布版最接近
 # 坑1：LLVM 10.0.1 的 x86_64 资产只发布了 ubuntu-16.04（没有 18.04）
