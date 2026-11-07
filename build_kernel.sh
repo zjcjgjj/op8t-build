@@ -295,16 +295,30 @@ set_cfg CONFIG_KSU_SYSCALL_TABLE_HOOK y
 set_cfg CONFIG_MODULE_SIG_FORCE n
 set_cfg CONFIG_MODULE_SIG n
 set_cfg CONFIG_MODVERSIONS n
+# ↓↓ 提速：调试信息不进 Image，却占掉整个编译时间的一大半（clang 生成 DWARF 极慢）
+set_cfg CONFIG_DEBUG_INFO n
+set_cfg CONFIG_DEBUG_INFO_REDUCED n
+set_cfg CONFIG_DEBUG_INFO_DWARF4 n
+set_cfg CONFIG_GDB_SCRIPTS n
 make ARCH=arm64 O=out $KMAKE_ARGS olddefconfig
 
 grep -E "^CONFIG_(KSU|KPROBES|KALLSYMS_ALL|MODVERSIONS|MODULE_SIG)" out/.config || true
 
+# 早期断言：配置没真正生效就立刻停，别等编译几十分钟才失败
+for k in CONFIG_KSU CONFIG_KSU_SYSCALL_TABLE_HOOK CONFIG_KALLSYMS_ALL CONFIG_EXT4_FS; do
+  grep -q "^$k=y" out/.config || { echo "配置未生效：$k —— 中止"; exit 1; }
+done
+echo "  KSU 相关: $(grep -E '^CONFIG_KSU' out/.config | tr '\n' ' ')"
+echo "  DEBUG_INFO: $(grep -E '^CONFIG_DEBUG_INFO' out/.config | tr '\n' ' ')"
+
 # ---------------------------------------------------------------- 6. 编译
 log "开始编译 Image（jobs=$JOBS）"
+T0=$(date +%s)
 make -j"$JOBS" ARCH=arm64 O=out \
   CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
   KCFLAGS="-Wno-error" \
   Image
+log "编译完成，耗时 $(( $(date +%s) - T0 )) 秒"
 
 IMG="out/arch/arm64/boot/Image"
 [ -f "$IMG" ] || { echo "编译失败：找不到 $IMG"; exit 1; }
