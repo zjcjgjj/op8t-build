@@ -111,6 +111,43 @@ fi
 log "私有模块源码就位：$(find vendor/oplus/kernel/oplus_performance -maxdepth 1 -type d | wc -l) 个目录"
 ls -l kernel/sched_assist block/blk include/linux/sched_assist | sed 's/^/    /'
 
+# 私有模块里还有按完整 AOSP 树层级写死的相对 include，例如
+#   #include "../../../../kernel/msm-4.19/drivers/power/supply/qcom/storm-watch.h"
+# 合并后的树里 kernel/msm-4.19 其实就是源码根本身，层级对不上。
+# 统一改成源码根绝对路径，一次覆盖所有这类引用。
+log "规范化 kernel/msm-4.19 跨树 include"
+python3 - <<'PYEOF'
+import os, re
+ROOT = os.getcwd()
+PAT = re.compile(r'(#\s*include\s*)["<](?:\.\./)+kernel/msm-4\.19/([^">]+)[">]')
+changed, missing = 0, []
+for base, dirs, files in os.walk(ROOT):
+    if '.git' in dirs:
+        dirs.remove('.git')
+    for f in files:
+        if not f.endswith(('.c', '.h')):
+            continue
+        p = os.path.join(base, f)
+        try:
+            t = open(p, encoding='utf-8', errors='replace').read()
+        except OSError:
+            continue
+        if 'kernel/msm-4.19' not in t:
+            continue
+        def rep(m):
+            return m.group(1) + '"' + os.path.join(ROOT, m.group(2)) + '"'
+        new = PAT.sub(rep, t)
+        if new != t:
+            open(p, 'w', encoding='utf-8').write(new)
+            changed += 1
+            for m in PAT.finditer(t):
+                if not os.path.isfile(os.path.join(ROOT, m.group(2))):
+                    missing.append(m.group(2))
+print('  规范化 %d 个文件中的跨树 include' % changed)
+for x in missing[:8]:
+    print('  WARN 目标不存在:', x)
+PYEOF
+
 # ---------------------------------------------------------------- 2. 工具链
 # 官方镜像 version 串为 clang 10.0.7 → 用 LLVM 10.0.1 官方发布版最接近
 # 坑1：LLVM 10.0.1 的 x86_64 资产只发布了 ubuntu-16.04（没有 18.04）
