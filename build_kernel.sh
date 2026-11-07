@@ -119,25 +119,8 @@ log "规范化私有模块的跨树 include"
 python3 - <<'PYEOF'
 import os, re
 ROOT = os.getcwd()
-PAT_AOSP = re.compile(r'(#\s*include\s*)["<](?:\.\./)+kernel/msm-4\.19/([^">]+)[">]')
-INC_REL = re.compile(r'(#\s*include\s*)"([^"]+)"')
-cnt = {'aosp': 0, 'rel': 0}
-changed = 0
-
-# 头文件后缀 -> 绝对路径 索引（如 "dsi/dsi_display.h" ->
-# <root>/techpack/display/msm/dsi/dsi_display.h）
-hdr_idx = {}
-for base, dirs, files in os.walk(ROOT):
-    if '.git' in dirs:
-        dirs.remove('.git')
-    for f in files:
-        if not f.endswith('.h'):
-            continue
-        h = os.path.join(base, f).replace('\\', '/')
-        parts = os.path.relpath(h, ROOT).replace('\\', '/').split('/')
-        for i in range(len(parts)):
-            hdr_idx.setdefault('/'.join(parts[i:]), h)
-
+PAT = re.compile(r'(#\s*include\s*)["<](?:\.\./)+kernel/msm-4\.19/([^">]+)[">]')
+changed, missing = 0, []
 for base, dirs, files in os.walk(ROOT):
     if '.git' in dirs:
         dirs.remove('.git')
@@ -149,39 +132,31 @@ for base, dirs, files in os.walk(ROOT):
             t = open(p, encoding='utf-8', errors='replace').read()
         except OSError:
             continue
-        if '#include' not in t:
+        if 'kernel/msm-4.19' not in t:
             continue
-
-        def rep_aosp(m):
-            cnt['aosp'] += 1
+        def rep(m):
             return m.group(1) + '"' + os.path.join(ROOT, m.group(2)).replace('\\', '/') + '"'
-
-        STD_PREFIX = ('linux/', 'asm/', 'uapi/', 'dt-bindings/', 'generated/',
-                      'trace/', 'soc/', 'net/', 'crypto/', 'sound/', 'video/')
-
-        def rep_rel(m):
-            inc = m.group(2)
-            if '/' not in inc or inc.startswith('/') or inc.startswith(STD_PREFIX):
-                return m.group(0)
-            # 常规搜索路径已经能找到 -> 不动，避免误改
-            if (os.path.isfile(os.path.join(ROOT, inc)) or
-                os.path.isfile(os.path.join(ROOT, 'include', inc)) or
-                os.path.isfile(os.path.join(os.path.dirname(p), inc))):
-                return m.group(0)
-            target = hdr_idx.get(inc)
-            if target and os.path.isfile(target):
-                cnt['rel'] += 1
-                return m.group(1) + '"' + target + '"'
-            return m.group(0)
-
-        new = INC_REL.sub(rep_rel, PAT_AOSP.sub(rep_aosp, t))
+        new = PAT.sub(rep, t)
         if new != t:
             open(p, 'w', encoding='utf-8').write(new)
             changed += 1
-print('  AOSP 跨树 include 修正: %d 处' % cnt['aosp'])
-print('  相对 include 改绝对路径: %d 处' % cnt['rel'])
-print('  共改动 %d 个文件' % changed)
+            for m in PAT.finditer(t):
+                if not os.path.isfile(os.path.join(ROOT, m.group(2))):
+                    missing.append(m.group(2))
+print('  规范化 %d 个文件中的跨树 include' % changed)
+for x in missing[:8]:
+    print('  WARN 目标不存在:', x)
 PYEOF
+
+# techpack 头文件靠官方 Makefile 里硬编码的
+#   -I$(srctree)/kernel/msm-4.19/techpack/... 解析（如 dsi/dsi_display.h、
+#   msm_drv.h）。合并后的树层级不同，这里自动把所有含 .h 的 techpack 目录补进 -I。
+EXTRA_INC=""
+for d in $(find "$WORK/kernel/techpack" "$WORK/kernel/kernel/msm-4.19/techpack" \
+            -type f -name '*.h' -printf '%h\n' 2>/dev/null | sort -u); do
+  EXTRA_INC="$EXTRA_INC -I$d"
+done
+echo "  补充头文件搜索路径: $(echo "$EXTRA_INC" | wc -w) 个"
 
 # ---------------------------------------------------------------- 2. 工具链
 # 官方镜像 version 串为 clang 10.0.7 → 用 LLVM 10.0.1 官方发布版最接近
@@ -571,7 +546,7 @@ fi
 T0=$(date +%s)
 make -j"$JOBS" ARCH=arm64 O=out \
   CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-  KCFLAGS="-Wno-error" $MAKE_EXTRA \
+  KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
   Image
 log "编译完成，耗时 $(( $(date +%s) - T0 )) 秒"
 if command -v ccache >/dev/null 2>&1; then ccache -s 2>/dev/null | head -8 || true; fi
