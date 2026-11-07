@@ -17,6 +17,12 @@ set -euo pipefail
 
 KERNEL_REPO="${KERNEL_REPO:-https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git}"
 KERNEL_BRANCH="${KERNEL_BRANCH:-oneplus/sm8250_u_14.0.0_op8t}"
+# 一加把 oplus 私有模块源码单独开源在另一个仓库；主仓库里
+# kernel/sched_assist、block/blk、include/linux/sched_assist 等全是指向
+# vendor/oplus/kernel/oplus_performance/... 的 symlink，单独 clone 是断链。
+# 不补这份源码会缺头文件（如 sched_assist_locking.h）导致编译中断。
+MODULES_REPO="${MODULES_REPO:-https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8250.git}"
+MODULES_BRANCH="${MODULES_BRANCH:-oneplus/sm8250_u_14.0.0_op8t}"
 KSU_REPO="${KSU_REPO:-https://github.com/KernelSU-Next/KernelSU-Next.git}"
 KSU_TAG="${KSU_TAG:-v3.4.0-legacy}"     # 4.19 非 GKI 必须用 legacy 分支（带 compat 兼容层）
 DEFCONFIG="${DEFCONFIG:-vendor/kona-perf_defconfig}"
@@ -47,6 +53,25 @@ if [ ! -d kernel ]; then
 else
   log "源码已存在，跳过克隆"
 fi
+
+# ---------------------------------------------------------------- 1b. 补齐 oplus 私有模块源码
+if [ ! -d "$WORK/kernel/vendor/oplus/kernel/oplus_performance" ]; then
+  log "克隆一加私有模块源码（$MODULES_BRANCH，约 34MB）"
+  rm -rf "$WORK/modules"
+  git clone --depth 1 -b "$MODULES_BRANCH" "$MODULES_REPO" "$WORK/modules"
+  rm -rf "$WORK/modules/.git"
+  # 合并到内核源码树根目录，让所有断链 symlink 解析成功
+  cp -a "$WORK/modules/." "$WORK/kernel/"
+  rm -rf "$WORK/modules"
+else
+  log "私有模块源码已存在，跳过"
+fi
+cd "$WORK/kernel"
+if [ ! -f include/linux/sched_assist/sched_assist_locking.h ]; then
+  echo "私有头文件未就位（sched_assist_locking.h）—— 中止"; exit 1
+fi
+log "私有模块源码就位：$(find vendor/oplus/kernel/oplus_performance -maxdepth 1 -type d | wc -l) 个目录"
+ls -l kernel/sched_assist block/blk include/linux/sched_assist | sed 's/^/    /'
 
 # ---------------------------------------------------------------- 2. 工具链
 # 官方镜像 version 串为 clang 10.0.7 → 用 LLVM 10.0.1 官方发布版最接近
@@ -122,7 +147,8 @@ cd "$WORK/kernel"
 #   #endif
 # ），标准 kconfig 解析器不认识 #ifdef，会报 unexpected/invalid option；
 # 且 sched_assist/tuning/uad 这些目录在本分支里只是几十字节的占位文件（源码未开源）。
-# 官方构建时这些宏同样未定义 → 这里按"未定义"剔除整块，等价还原官方行为。
+# 官方构建用 C 预处理器处理 Kconfig，这些 OPLUS_FEATURE_* 宏是定义过的；
+# 现在私有源码已补齐，按「宏已定义」保留 #ifdef 块内容、丢弃 #ifndef 块。
 log "预处理 Kconfig 中的 #ifdef 块"
 python3 - <<'PYEOF'
 import os, re
@@ -137,9 +163,9 @@ def strip(path):
                 hit = True
                 d = m.group(2)
                 if d == 'ifdef':
-                    keep.append(False)          # 宏未定义 → 丢弃
+                    keep.append(True)           # 官方定义了该宏 → 保留内容
                 elif d == 'ifndef':
-                    keep.append(True)           # 宏未定义 → 保留
+                    keep.append(False)          # 官方定义了该宏 → 丢弃内容
                 elif d == 'elif':
                     if keep: keep[-1] = False
                 elif d == 'else':
