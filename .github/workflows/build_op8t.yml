@@ -1,0 +1,78 @@
+name: build-op8t-clean
+
+# 用社区完整 ColorOS/OOS 树（toraidl op8t 分支）干净编译：
+#   base = 无 KernelSU 的空白对照
+#   ksu  = 内置 KernelSU-Next legacy
+# 两个阶段并行跑，各自产出 Image + dtb + dtbo.img + .config
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '内核分支（默认 op8t）'
+        required: false
+        default: 'op8t'
+      defconfig:
+        description: 'defconfig'
+        required: false
+        default: 'vendor/kona-perf_defconfig'
+      ksu_ref:
+        description: 'KernelSU-Next 分支'
+        required: false
+        default: 'legacy'
+
+env:
+  KERNEL_REPO: https://github.com/toraidl/android_kernel_oneplus_sm8250.git
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: '1'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [base, ksu]
+    steps:
+      - name: 检出构建脚本
+        uses: actions/checkout@v4
+
+      - name: 环境准备
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev openssl \
+            python3 python3-pip zip unzip xz-utils git curl wget
+          df -h /
+          nproc
+          free -g
+
+      - name: 编译 ${{ matrix.phase }}
+        env:
+          PHASE: ${{ matrix.phase }}
+          KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+          DEFCONFIG: ${{ github.event.inputs.defconfig }}
+          KSU_REF: ${{ github.event.inputs.ksu_ref }}
+          JOBS: '4'
+        run: |
+          set -o pipefail
+          chmod +x build_op8t.sh
+          ./build_op8t.sh 2>&1 | tee build_${{ matrix.phase }}.log
+          echo "---- 文件清单 ----"
+          ls -la out/
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.phase }}
+          path: |
+            out/kernel_op8t_${{ matrix.phase }}
+            out/kernel_op8t_${{ matrix.phase }}.dtb
+            out/kernel_op8t_${{ matrix.phase }}_dtbo.img
+            out/kernel_op8t_${{ matrix.phase }}.config
+            out/kernel_op8t_${{ matrix.phase }}.crc
+            build_${{ matrix.phase }}.log
+          if-no-files-found: warn
+          retention-days: 7
