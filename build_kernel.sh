@@ -349,6 +349,37 @@ grep -q 'ksu_crc_fix.o' drivers/Makefile || \
   printf '\nobj-y += ksu_crc_fix.o\n' >> drivers/Makefile
 log "已补齐 genksyms 失败符号的 __crc_* 绝对定义"
 
+# ---------------------------------------------------------------------------
+# CONFIG_KALLSYMS_BASE_RELATIVE 是 init/Kconfig 里无 prompt 的 bool（default !IA64），
+# 无法用 .config 关闭。它的 relative_base 取自「镜像里最小的非绝对符号地址」。
+# 上面用 .weak/.set 补出来的 __crc_* 在 nm 里可能被当成普通符号、值为 0，
+# 会把 relative_base 拉到 0，导致所有内核符号的 32 位相对偏移溢出：
+#   kallsyms failure: relative symbol value 0xffffff8008080000 out of range ...
+# 这类 CRC 符号本来就不该出现在 kallsyms 表里，直接过滤掉；同时让
+# record_relative_base() 跳过 0 地址，双保险。
+# ---------------------------------------------------------------------------
+python3 - <<'PYEOF'
+p = 'scripts/kallsyms.c'
+s = open(p, encoding='utf-8', errors='replace').read()
+if 'KSU_IGNORE_CRC' not in s:
+    n1 = '\tif (strlen(sym) >= KSYM_NAME_LEN) {'
+    ins = ('\t/* KSU_IGNORE_CRC: genksyms 补桩符号是 0 值绝对常量，不能进 kallsyms 表 */\n'
+           '\tif (!strncmp(sym, "__crc_", 6))\n'
+           '\t\treturn -1;\n\n')
+    assert n1 in s, 'kallsyms.c 结构变化：找不到 read_symbol 插入点'
+    s = s.replace(n1, ins + n1, 1)
+    n2 = '\t\tif (!symbol_absolute(&table[i]) &&\n\t\t    table[i].addr < relative_base)'
+    rep = ('\t\tif (!symbol_absolute(&table[i]) &&\n'
+           '\t\t    table[i].addr != 0 &&\n'
+           '\t\t    table[i].addr < relative_base)')
+    assert n2 in s, 'kallsyms.c 结构变化：找不到 record_relative_base 插入点'
+    s = s.replace(n2, rep, 1)
+    open(p, 'w', encoding='utf-8').write(s)
+    print('  已给 scripts/kallsyms.c 打补丁（忽略 __crc_* / 基准跳过 0）')
+else:
+    print('  kallsyms.c 补丁已存在')
+PYEOF
+
 # ---------------------------------------------------------------- 5. 配置内核
 cd "$WORK/kernel"
 
