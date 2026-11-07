@@ -253,6 +253,54 @@ fi
 grep -n 'kernelsu/Kconfig' Kconfig | sed 's/^/    /'
 ls -l kernelsu | sed 's/^/    /'
 
+# 合并后的源码树里，一加私有增强模块（UFS plus / techpack display /
+# sched_assist / router boost 等）没有全部编进 vmlinux，链接时会留下
+# undefined reference。这里提供弱符号占位：一旦真实实现被编入，
+# 链接器自动优先使用强符号；否则这些可选增强变成 no-op，不影响内核启动。
+cd "$WORK/kernel"
+cat > drivers/ksu_compat_stubs.c <<'CEOF'
+/* 4.19 构建兼容层：为可选私有增强符号提供弱占位实现。
+   真实实现存在时链接器会选择强符号，本文件自动让位。 */
+#include <linux/kernel.h>
+#define KSU_WEAK_STUB(name) __attribute__((weak)) long name(void) { return 0; }
+
+KSU_WEAK_STUB(create_signal_quality_proc)
+KSU_WEAK_STUB(dsi_panel_need_rewrite_reg)
+KSU_WEAK_STUB(get_main_display)
+KSU_WEAK_STUB(io_latency_hist_show)
+KSU_WEAK_STUB(is_reclaim_should_cancel)
+KSU_WEAK_STUB(msm_drm_register_client)
+KSU_WEAK_STUB(msm_drm_unregister_client)
+KSU_WEAK_STUB(oplus_router_boost_handler)
+KSU_WEAK_STUB(path_umount)
+KSU_WEAK_STUB(recordUniproErr)
+KSU_WEAK_STUB(register_lcdinfo_notifier)
+KSU_WEAK_STUB(remove_signal_quality_proc)
+KSU_WEAK_STUB(remove_ufsplus_ctrl_proc)
+KSU_WEAK_STUB(ufsf_change_read10_debug_lun)
+KSU_WEAK_STUB(ufsf_check_query)
+KSU_WEAK_STUB(ufsf_device_check)
+KSU_WEAK_STUB(ufsf_hpb_noti_rb)
+KSU_WEAK_STUB(ufsf_hpb_suspend)
+KSU_WEAK_STUB(ufsf_init)
+KSU_WEAK_STUB(ufsf_on_idle)
+KSU_WEAK_STUB(ufsf_prep_fn)
+KSU_WEAK_STUB(ufsf_query_ioctl)
+KSU_WEAK_STUB(ufsf_remove)
+KSU_WEAK_STUB(ufsf_reset)
+KSU_WEAK_STUB(ufsf_reset_host)
+KSU_WEAK_STUB(ufsf_reset_lu)
+KSU_WEAK_STUB(ufsf_resume)
+KSU_WEAK_STUB(ufsf_set_init_state)
+KSU_WEAK_STUB(ufsf_slave_configure)
+KSU_WEAK_STUB(ufsf_tw_enable)
+KSU_WEAK_STUB(unregister_lcdinfo_notifier)
+KSU_WEAK_STUB(update_user_tasklist)
+CEOF
+grep -q 'ksu_compat_stubs.o' drivers/Makefile || \
+  printf '\nobj-y += ksu_compat_stubs.o\n' >> drivers/Makefile
+log "已注入弱符号兼容层（drivers/ksu_compat_stubs.c）"
+
 # ---------------------------------------------------------------- 5. 配置内核
 cd "$WORK/kernel"
 
@@ -472,6 +520,31 @@ set_cfg CONFIG_DEBUG_INFO n
 set_cfg CONFIG_DEBUG_INFO_REDUCED n
 set_cfg CONFIG_DEBUG_INFO_DWARF4 n
 set_cfg CONFIG_GDB_SCRIPTS n
+
+# 关闭一加私有增强开关，让 UFS plus / sched_assist / display notifier 等
+# 调用点直接不参与编译。这比只靠弱桩更安全：存储路径上的 ufsf_* 若被
+# 空实现接管，可能造成 I/O 异常。弱桩只作为最后兜底。
+python3 - <<'PY'
+import re
+p = 'out/.config'
+PRIV = re.compile(r'^CONFIG_(OPLUS|UFSFEATURE|UFSTW|UFSHPB|SCHED_ASSIST|'
+                  r'LOCKING_PROTECT|FRAME_BOOST|UXIO|HEALTHINFO|.*_OPLUS)')
+out, n = [], 0
+for l in open(p, encoding='utf-8', errors='replace'):
+    l = l.rstrip('\n')
+    m = re.match(r'^([A-Z0-9_]+)=', l)
+    if m and PRIV.match(l):
+        out.append('# %s is not set' % m.group(1))
+        n += 1
+    else:
+        out.append(l)
+open(p, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+print('  关闭 %d 个私有特性开关' % n)
+PY
+for k in CONFIG_UFSFEATURE CONFIG_UFSTW CONFIG_UFSHPB CONFIG_LOCKING_PROTECT \
+         CONFIG_OPLUS_FEATURE_UFSPLUS CONFIG_SCHED_ASSIST; do
+  set_cfg "$k" n
+done
 make ARCH=arm64 O=out $KMAKE_ARGS olddefconfig
 
 grep -E "^CONFIG_(KSU|KPROBES|KALLSYMS_ALL|MODVERSIONS|MODULE_SIG)" out/.config || true
