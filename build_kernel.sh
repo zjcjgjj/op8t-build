@@ -169,6 +169,19 @@ print('  cleaned %d kconfig file(s)' % n)
 # kconfig 会 fatal 退出。这里把指向不存在文件的 source 行注释掉。
 SRC_A = re.compile(r'^(\s*)source\s+"([^"]+)"\s*$')
 SRC_B = re.compile(r'^(\s*)source\s+(\S+)\s*$')
+VAR = re.compile(r'\$\(([A-Za-z0-9_]+)\)')
+# 关键：Kconfig 的 source 允许带 $(SRCARCH) 这类变量。
+# arch/Kconfig:1978 的 source "arch/$(SRCARCH)/Kconfig" 若按字面路径判断
+# 会被误判成断链 → CONFIG_ARM64 / CONFIG_64BIT 全部丢失 →
+# 编译到 kernel/bounds.s 才报 unknown type name 'atomic64_t'。
+# 本构建固定 arm64，先把变量展开成真实路径再判断。
+KENV = {'SRCARCH': 'arm64', 'ARCH': 'arm64', 'srctree': '.',
+        'objtree': '.', 'KERNELVERSION': '4.19.157'}
+
+def expand_vars(s):
+    return VAR.sub(lambda m: KENV.get(m.group(1), m.group(0)), s)
+
+skipped = []
 
 def fix_sources():
     changed = 0
@@ -189,9 +202,15 @@ def fix_sources():
                 m = SRC_A.match(line) or SRC_B.match(line)
                 if m:
                     tgt = m.group(2)
-                    cands = [tgt, os.path.normpath(os.path.join(root, tgt))]
+                    resolved = expand_vars(tgt)
+                    if '$(' in resolved:
+                        # 变量无法解析 → 一律保留，绝不注释
+                        out.append(line)
+                        continue
+                    cands = [resolved, os.path.normpath(os.path.join(root, resolved))]
                     if not any(os.path.isfile(c) for c in cands):
                         out.append('%s# [skip] dangling source: %s\n' % (m.group(1), tgt))
+                        skipped.append('%s -> %s' % (p, tgt))
                         hit = True
                         continue
                 out.append(line)
@@ -201,6 +220,14 @@ def fix_sources():
     return changed
 
 print('  fixed %d kconfig with dangling source' % fix_sources())
+for s in skipped[:12]:
+    print('    skipped: %s' % s)
+if len(skipped) > 12:
+    print('    ... 共 %d 条' % len(skipped))
+# 架构 Kconfig 必须保留，这是硬性校验
+for must in ('arch/$(SRCARCH)/Kconfig',):
+    if any(must in s for s in skipped):
+        raise SystemExit('FATAL: 架构 Kconfig 被跳过，配置必然残缺')
 
 # Makefile 里 obj-y += blk/ 这类指向不存在目录的条目同样会让 kbuild 直接报错，
 # 只处理「整行所有目录都不存在」的情况，避免误伤。
@@ -339,6 +366,19 @@ KBEOF
   echo "  已启用 Kbuild 兜底（HAVE_KSU_HOOK=0 + -DKSU_SYSCALL_TABLE_HOOK）"
 fi
 
+# 架构 Kconfig 必须真的被加载：arch/Kconfig 里的
+#   source "arch/$(SRCARCH)/Kconfig"
+# 一旦被当成断链注释掉，CONFIG_ARM64 / CONFIG_64BIT 全丢，
+# 要等编译几分钟才在 kernel/bounds.s 报 unknown type name 'atomic64_t'。
+# 这里提前断言，配置阶段立刻失败。
+for k in CONFIG_ARM64 CONFIG_64BIT; do
+  grep -q "^$k=y" out/.config || { echo "架构 Kconfig 未加载：$k 缺失 —— 中止"; exit 1; }
+done
+if ! grep -q '^#define CONFIG_64BIT 1' out/include/generated/autoconf.h; then
+  echo "autoconf.h 缺 CONFIG_64BIT —— 中止"; exit 1
+fi
+echo "  架构: $(grep -E '^CONFIG_(ARM64|64BIT)=' out/.config | tr '\n' ' ')"
+
 # 早期断言：核心配置没真正生效就立刻停，别等编译几十分钟才失败
 grep -q "^CONFIG_KSU=y" out/.config || { echo "配置未生效：CONFIG_KSU —— 中止"; exit 1; }
 grep -q "^CONFIG_KALLSYMS_ALL=y" out/.config || { echo "配置未生效：CONFIG_KALLSYMS_ALL —— 中止"; exit 1; }
@@ -351,12 +391,24 @@ grep -E "^(# )?CONFIG_(KSU|KPROBES|EXT4_FS|OVERLAY_FS|DEBUG_INFO|MODULES|MODVERS
 
 # ---------------------------------------------------------------- 6. 编译
 log "开始编译 Image（jobs=$JOBS）"
+# ccache：失败重跑时绝大多数 .o 直接命中缓存，编译从十几分钟降到 1-3 分钟。
+# 出问题可用 USE_CCACHE=0 关掉。defconfig 阶段仍用裸 clang（kconfig 要读 CC）。
+BUILD_CC="clang"
+if [ "${USE_CCACHE:-1}" = "1" ] && command -v ccache >/dev/null 2>&1; then
+  export CCACHE_DIR="${CCACHE_DIR:-$WORK/.ccache}"
+  mkdir -p "$CCACHE_DIR"
+  ccache -M 4G >/dev/null 2>&1 || true
+  ccache -z >/dev/null 2>&1 || true
+  BUILD_CC="ccache clang"
+  echo "  ccache 已启用：$CCACHE_DIR"
+fi
 T0=$(date +%s)
 make -j"$JOBS" ARCH=arm64 O=out \
-  CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+  CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
   KCFLAGS="-Wno-error" $MAKE_EXTRA \
   Image
 log "编译完成，耗时 $(( $(date +%s) - T0 )) 秒"
+if command -v ccache >/dev/null 2>&1; then ccache -s 2>/dev/null | head -8 || true; fi
 
 IMG="out/arch/arm64/boot/Image"
 [ -f "$IMG" ] || { echo "编译失败：找不到 $IMG"; exit 1; }
