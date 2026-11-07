@@ -32,7 +32,8 @@ STOCK_BOOT="${STOCK_BOOT:-$PWD/stock_boot_KB2000_14.0.0.602.img}"
 PART_SIZE=100663296                    # 8T boot 分区固定 96MiB
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+warn() { printf '\n\033[1;33m[!] %s\033[0m\n' "$*"; }
 
 # ---------------------------------------------------------------- 0. 依赖检查
 log "检查依赖"
@@ -314,6 +315,32 @@ CEOF
 grep -q 'ksu_compat_stubs.o' drivers/Makefile || \
   printf '\nobj-y += ksu_compat_stubs.o\n' >> drivers/Makefile
 log "已注入弱符号兼容层（drivers/ksu_compat_stubs.c）"
+
+# ---------------------------------------------------------------------------
+# CONFIG_MODVERSIONS=y 时 EXPORT_SYMBOL 会在 ___kcrctab+sym 段里放
+#   .weak __crc_<sym>
+#   .long __crc_<sym>
+# 正常情况下 genksyms 会把 __crc_<sym> 定义成绝对常量，链接器静态解析。
+# 但本分支的 gsi_write_channel_scratch 会让 modpost 报
+#   "version generation failed, symbol will not be versioned"
+# 于是 __crc_* 变成【未定义 weak 符号】，vmlinux 的 PIE 链接下产生
+# 非法 R_AARCH64_ABS32 重定位：
+#   ld.lld : relocation R_AARCH64_ABS32 cannot be used ... recompile with -fPIC
+#   GNU ld : dangerous relocation: unsupported relocation
+# 换链接器、加 -z notext 都只是绕过；这里把它定义成绝对常量 0，
+# 链接器可静态解析、不产生动态重定位，且语义与「该符号无 CRC」一致。
+# ---------------------------------------------------------------------------
+cat > drivers/ksu_crc_fix.c <<'CFEOF'
+/* genksyms 无法生成 CRC 的导出符号，补一个绝对定义以消除 PIE 下的
+ * R_AARCH64_ABS32 重定位。值 0 等价于「该符号未版本化」。 */
+__asm__(
+    ".weak  __crc_gsi_write_channel_scratch\n\t"
+    ".set   __crc_gsi_write_channel_scratch, 0\n"
+);
+CFEOF
+grep -q 'ksu_crc_fix.o' drivers/Makefile || \
+  printf '\nobj-y += ksu_crc_fix.o\n' >> drivers/Makefile
+log "已补齐 genksyms 失败符号的 __crc_* 绝对定义"
 
 # ---------------------------------------------------------------- 5. 配置内核
 cd "$WORK/kernel"
@@ -656,33 +683,59 @@ if [ "${USE_CCACHE:-1}" = "1" ] && command -v ccache >/dev/null 2>&1; then
 fi
 T0=$(date +%s)
 # ---------------------------------------------------------------------------
-# CONFIG_MODVERSIONS=y 会给每个导出符号生成 __crc_*（放在 .data），
-# GNU ld.bfd 在 vmlinux 的 PIE/shared 链接下对 R_AARCH64_ABS32 报：
-#   "dangerous relocation: unsupported relocation"
-# 官方 AOSP 用 ld.lld 链接，不会触发。这里 lld 优先，失败则自动回退
-# GNU ld + LDFLAGS_vmlinux=-z notext（允许该重定位）。
-# 两种尝试都在同一轮 workflow 内完成，第二次是增量链接、只需几十秒。
+# CONFIG_MODVERSIONS=y 时 EXPORT_SYMBOL 会引用 __crc_<sym>（ABS32）。
+# genksyms 对个别符号报 "version generation failed" 时，该符号变成未定义
+# weak，vmlinux 的 PIE 链接下产生非法重定位：
+#   ld.lld : relocation R_AARCH64_ABS32 cannot be used ... recompile with -fPIC
+#   GNU ld : dangerous relocation: unsupported relocation
+# 根因在符号本身，换链接器只能绕过。策略：
+#   1) ld.lld 链接；
+#   2) 失败则从错误行自动抓出所有未定义 __crc_*，补绝对定义后增量重链；
+#   3) 仍失败才回退 GNU ld + -z notext。
+# 三次尝试都在同一轮 workflow 内，2/3 步只重编一个 C 文件 + 重链。
 # ---------------------------------------------------------------------------
 LINK_OK=0
+LINK1="$WORK/link1.log"
+MAKE_BASE="ARCH=arm64 O=out"
 if command -v ld.lld >/dev/null 2>&1; then
-  log "链接器：ld.lld（LLVM，规避 __crc_* 的 ABS32 重定位）"
-  if make -j"$JOBS" ARCH=arm64 O=out \
+  log "链接器：ld.lld（LLVM）"
+  if make -j"$JOBS" $MAKE_BASE \
       CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
       LD=ld.lld KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
-      Image; then
+      Image 2>&1 | tee "$LINK1"; then
     LINK_OK=1
   else
-    warn "ld.lld 链接失败，自动回退 GNU ld + -z notext（增量重链）"
+    warn "ld.lld 首次链接失败，扫描未定义的 __crc_* 符号"
+    CRC_ADDED=0
+    SYMS=$(grep -a -E 'cannot be used against symbol __crc_|relocation R_AARCH64_ABS32 against .__crc_' "$LINK1" \
+             | grep -a -oE '__crc_[A-Za-z0-9_]+' | sort -u || true)
+    for s in $SYMS; do
+      if ! grep -qF "$s" drivers/ksu_crc_fix.c; then
+        printf '__asm__(".weak %s\\n\\t.set %s, 0\\n");\n' "$s" "$s" >> drivers/ksu_crc_fix.c
+        warn "补齐未定义 CRC 符号: $s"
+        CRC_ADDED=1
+      else
+        echo "  $s 已在修补单元中定义"
+      fi
+    done
+    if [ "$CRC_ADDED" = "1" ]; then
+      log "补齐后增量重链（ld.lld）"
+      if make -j"$JOBS" $MAKE_BASE \
+          CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+          LD=ld.lld KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
+          Image; then
+        LINK_OK=1
+      fi
+    fi
   fi
 else
   warn "未找到 ld.lld，直接使用 GNU ld + -z notext"
 fi
 if [ "$LINK_OK" != "1" ]; then
-  # 不覆盖 LDFLAGS_vmlinux（内核 Makefile 会用它拼必要的链接选项，
-  # 命令行赋值会让 makefile 里的 += 全部失效），改为把 -z notext 直接
-  # 附加到链接器命令上，原有参数一个不少。
-  log '链接器：GNU ld + "-z notext"（允许 __crc_* 的 ABS32 重定位）'
-  make -j"$JOBS" ARCH=arm64 O=out \
+  # 不覆盖 LDFLAGS_vmlinux（内核 Makefile 会用它拼必要链接选项），
+  # 改为把 -z notext 直接附加到链接器命令上，原有参数一个不少。
+  log '回退：GNU ld + "-z notext"'
+  make -j"$JOBS" $MAKE_BASE \
     CC="$BUILD_CC" CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
     LD="aarch64-linux-gnu-ld -z notext" KCFLAGS="-Wno-error $EXTRA_INC" $MAKE_EXTRA \
     Image
