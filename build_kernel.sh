@@ -381,33 +381,39 @@ else:
 PYEOF
 
 # ---------------------------------------------------------------------------
-# 真机实测 v8：内核能启动、Android 能起（adb 在线），但 vendor .ko 几乎全部
-# 拒载：/proc/modules 只剩 q6_pdr_dlkm，lcd.ko 未加载 -> SurfaceFlinger
-# 反复 restarting -> 黑屏、sys.boot_completed=0。
-# 根因是 CRC 校验链：CONFIG_MODVERSIONS=y 时 check_version() 拿内核导出符号
-# 的 CRC 与模块 __versions 段比对；自编译内核的 genksyms CRC 与原厂不一致
-# （另有一批 __crc_* 被 .set 0 补桩），且上面的 kallsyms 补丁把 __crc_*
-# 符号全部过滤。vermagic 字符串虽已匹配，CRC 数值仍会拒载。
-# 处理：保留 "modversions" 字符串（same_magic 仍需匹配），跳过 CRC 数值比对。
+# v10：对齐导出符号 CRC，而不是跳过校验。
+#
+# 离线取证结论（本地 analyze_abi.py / _logs/abi/abi_report.txt）：
+#   * 41 个 vendor .ko 需要内核提供 977 个符号，原厂 / v7 / v9 覆盖率完全
+#     一致（975/977），所有模块的内核侧依赖都齐备 -> 不缺符号；
+#   * 原厂 /proc/kallsyms 里 __crc_* 符号数为 0：4.19 的 CRC 编码在
+#     ___kcrctab 段，不依赖 kallsyms 表，推翻 v8 时的「过滤导致拒载」推断；
+#   * 真机：原厂开机 32 个模块全加载，v8 只有 1 个 -> 大面积拒载；
+#   * v9 把 check_version() 直接 return 1 仍失败。
+# => vermagic 已对齐、符号齐备，剩下唯一关卡是 modversions CRC 数值。
+#
+# 做法：在 genksyms 生成 .ver 链接器脚本时，用 stock_crc.txt（取自 41 个
+# 原厂 vendor .ko 的 __versions 段，1033 个符号，各模块 CRC 无冲突）覆盖
+# __crc_* 的值，让内核 CRC 与原厂逐项相同；check_version() 保持原厂实现，
+# 走正常的数值校验，不再跳过。
 # ---------------------------------------------------------------------------
 cd "$WORK/kernel"
-python3 - <<'PYEOF'
-import re
-p = 'kernel/module.c'
+cp "$HERE/stock_crc.txt" ./stock_crc.txt
+cp "$HERE/crc_override.py" ./crc_override.py
+KDIR="$WORK/kernel" python3 - <<'PYEOF'
+import os
+k = os.environ['KDIR']
+p = 'scripts/Makefile.build'
 s = open(p, encoding='utf-8', errors='replace').read()
-if 'KSU_SKIP_CRC' in s:
-    print('  module.c 补丁已存在')
-else:
-    m = re.search(r'(static\s+\w+\s+check_version\s*\([^;{]*?\)\s*\{)', s, re.S)
-    assert m, '找不到 check_version() 定义'
-    s = (s[:m.end()] +
-         '\n\t/* KSU_SKIP_CRC: 自编译内核 genksyms CRC 与原厂不同，\n'
-         '\t * 保留 vermagic 匹配、跳过 CRC 数值比对，放行 vendor .ko */\n'
-         '\treturn 1;\n' +
-         s[m.end():])
-    open(p, 'w', encoding='utf-8').write(s)
-    print('  已 patch kernel/module.c: check_version() 放行')
+old = '> $(@D)/.tmp_$(@F:.o=.ver);'
+new = '| python3 %s/crc_override.py > $(@D)/.tmp_$(@F:.o=.ver);' % k
+n = s.count(old)
+assert n >= 1, 'Makefile.build 结构变化：找不到 .ver 重定向'
+s = s.replace(old, new)
+open(p, 'w', encoding='utf-8').write(s)
+print('  已 patch %s：%d 处 genksyms 输出接入 CRC 覆盖' % (p, n))
 PYEOF
+log "已启用原厂 CRC 覆盖（1033 符号），check_version() 保持原厂实现"
 
 # ---------------------------------------------------------------- 5. 配置内核
 cd "$WORK/kernel"
@@ -814,6 +820,18 @@ IMG="out/arch/arm64/boot/Image"
 [ -f "$IMG" ] || { echo "编译失败：找不到 $IMG"; exit 1; }
 ls -lh "$IMG"
 grep -a -o "Linux version 4\.19\.[0-9]*-perf[^\"]\{0,40\}" "$IMG" | head -1 || true
+
+# ------------------------------------------------- 6.6 导出符号 CRC 硬校验
+# 覆盖层是否真正生效，不看日志，直接读 vmlinux 里 __crc_* 绝对符号的值。
+# 匹配率 < 99% 就中止，避免产出一个注定被 vendor .ko 拒载的内核。
+if [ -f "$WORK/kernel/out/vmlinux" ]; then
+  python3 "$HERE/crc_verify.py" "$WORK/kernel/out/vmlinux" "$HERE/stock_crc.txt" || {
+    warn "CRC 覆盖未生效，中止交付"
+    exit 1
+  }
+else
+  warn "找不到 vmlinux，跳过 CRC 硬校验（请人工复核 build.log）"
+fi
 
 # ------------------------------------------------- 6.5 vermagic 硬断言（能否开机的门槛）
 # 不等刷机再发现：编译产物里必须带 "modversions"，否则 vendor 模块全拒载。
