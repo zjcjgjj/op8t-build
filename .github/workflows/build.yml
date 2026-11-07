@@ -33,10 +33,19 @@ jobs:
           sudo apt-get clean
           df -h / | tail -1
 
-      - name: 加 8G swap（防 OOM 被杀）
+      - name: 加 swap（防 OOM 被杀）
         run: |
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
-          sudo chmod 600 /swapfile && sudo mkswap -q /swapfile && sudo swapon /swapfile
+          set +e
+          cur=$(free -m | awk '/^Swap:/{print $2}')
+          echo "现有 swap: ${cur} MB"
+          if [ "${cur:-0}" -lt 4096 ]; then
+            # 注意：Runner 镜像里 /swapfile 往往已被占用，用独立路径
+            sudo rm -f /swap2
+            sudo fallocate -l 8G /swap2 2>/dev/null || sudo dd if=/dev/zero of=/swap2 bs=1M count=8192 status=none
+            sudo chmod 600 /swap2
+            sudo mkswap /swap2 >/dev/null 2>&1
+            sudo swapon /swap2 2>/dev/null || echo "swapon 失败（已有 swap 也能继续）"
+          fi
           free -h | head -3
           echo "核数: $(nproc)"
 
