@@ -663,6 +663,28 @@ set_cfg CONFIG_GDB_SCRIPTS n
 # 统一由 drivers/ksu_compat_stubs.c 的弱桩兜住。
 make ARCH=arm64 O=out $KMAKE_ARGS olddefconfig
 
+# ---------------------------------------------------------------------------
+# v11: 逐项对齐原厂配置后，把 olddefconfig 又带出来的 debugfs / idle-stats
+# 类配置强制写回原厂值。
+# 依据：v10 真机黑屏重启后离线比对发现 86 项配置差异，其中
+# CONFIG_DEBUG_FS=y（原厂 n）会在大量驱动结构体里插入 debugfs 字段；
+# vendor .ko 是按官方 n 编译的，即使 modversions CRC 强行对齐放行，
+# 模块仍会按错位的结构体布局访问内存 -> 加载后崩。
+# MODULE_SIG_FORCE 仍保持 n：OSS 源码树公钥与原厂 OEM 私钥不配对，
+# FORCE=y 会让原厂签名模块全部验签失败。
+# ---------------------------------------------------------------------------
+if [ "${USE_STOCK_CONFIG:-0}" = "1" ]; then
+  for k in CONFIG_DEBUG_FS CONFIG_CMA_DEBUGFS CONFIG_BLK_DEBUGFS \
+           CONFIG_BT_DEBUGFS CONFIG_QMP_DEBUGFS_CLIENT \
+           CONFIG_REGMAP_ALLOW_WRITE_DEBUGFS CONFIG_WIL6210_DEBUGFS \
+           CONFIG_MSM_IDLE_STATS CONFIG_IPA_UT \
+           CONFIG_BALANCE_ANON_FILE_RECLAIM; do
+    set_cfg "$k" n
+  done
+  make ARCH=arm64 O=out $KMAKE_ARGS olddefconfig
+  python3 "$HERE/config_align.py" out/.config "$STOCK_CFG" || exit 1
+fi
+
 grep -E "^CONFIG_(KSU|KPROBES|KALLSYMS_ALL|MODVERSIONS|MODULE_SIG)" out/.config || true
 echo "  KPROBES: $(grep -E '^(CONFIG_KPROBES=y|# CONFIG_KPROBES)' out/.config)"
 echo "  MODULES: $(grep -E '^(CONFIG_MODULES=y|# CONFIG_MODULES)' out/.config)"
