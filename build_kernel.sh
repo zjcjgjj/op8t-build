@@ -380,6 +380,35 @@ else:
     print('  kallsyms.c 补丁已存在')
 PYEOF
 
+# ---------------------------------------------------------------------------
+# 真机实测 v8：内核能启动、Android 能起（adb 在线），但 vendor .ko 几乎全部
+# 拒载：/proc/modules 只剩 q6_pdr_dlkm，lcd.ko 未加载 -> SurfaceFlinger
+# 反复 restarting -> 黑屏、sys.boot_completed=0。
+# 根因是 CRC 校验链：CONFIG_MODVERSIONS=y 时 check_version() 拿内核导出符号
+# 的 CRC 与模块 __versions 段比对；自编译内核的 genksyms CRC 与原厂不一致
+# （另有一批 __crc_* 被 .set 0 补桩），且上面的 kallsyms 补丁把 __crc_*
+# 符号全部过滤。vermagic 字符串虽已匹配，CRC 数值仍会拒载。
+# 处理：保留 "modversions" 字符串（same_magic 仍需匹配），跳过 CRC 数值比对。
+# ---------------------------------------------------------------------------
+cd "$WORK/kernel"
+python3 - <<'PYEOF'
+import re
+p = 'kernel/module.c'
+s = open(p, encoding='utf-8', errors='replace').read()
+if 'KSU_SKIP_CRC' in s:
+    print('  module.c 补丁已存在')
+else:
+    m = re.search(r'(static\s+\w+\s+check_version\s*\([^;{]*?\)\s*\{)', s, re.S)
+    assert m, '找不到 check_version() 定义'
+    s = (s[:m.end()] +
+         '\n\t/* KSU_SKIP_CRC: 自编译内核 genksyms CRC 与原厂不同，\n'
+         '\t * 保留 vermagic 匹配、跳过 CRC 数值比对，放行 vendor .ko */\n'
+         '\treturn 1;\n' +
+         s[m.end():])
+    open(p, 'w', encoding='utf-8').write(s)
+    print('  已 patch kernel/module.c: check_version() 放行')
+PYEOF
+
 # ---------------------------------------------------------------- 5. 配置内核
 cd "$WORK/kernel"
 
