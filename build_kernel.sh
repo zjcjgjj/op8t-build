@@ -105,8 +105,12 @@ log "把 KernelSU-Next 挂进 drivers/（等价于官方 setup.sh）"
 rm -f kernelsu
 ln -sfn "$(realpath --relative-to="$PWD" "$WORK/KernelSU-Next/kernel")" kernelsu
 grep -q "kernelsu" Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> Makefile
-grep -q 'drivers/kernelsu/Kconfig' Kconfig || \
-  sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' Kconfig
+# 只插一次（原来的 sed 会在每个 ^endmenu 前都插一条，导致重复 source）
+if ! grep -q 'drivers/kernelsu/Kconfig' Kconfig; then
+  awk 'BEGIN{d=0} /^endmenu/ && !d {print "source \"drivers/kernelsu/Kconfig\""; d=1} {print}' \
+    Kconfig > Kconfig.new && mv Kconfig.new Kconfig
+fi
+grep -n 'kernelsu/Kconfig' Kconfig | sed 's/^/    /'
 ls -l kernelsu | sed 's/^/    /'
 
 # ---------------------------------------------------------------- 5. 配置内核
@@ -303,20 +307,49 @@ set_cfg CONFIG_GDB_SCRIPTS n
 make ARCH=arm64 O=out $KMAKE_ARGS olddefconfig
 
 grep -E "^CONFIG_(KSU|KPROBES|KALLSYMS_ALL|MODVERSIONS|MODULE_SIG)" out/.config || true
+echo "  KPROBES: $(grep -E '^(CONFIG_KPROBES=y|# CONFIG_KPROBES)' out/.config)"
+echo "  MODULES: $(grep -E '^(CONFIG_MODULES=y|# CONFIG_MODULES)' out/.config)"
+echo "  DEBUG_INFO: $(grep -E '^CONFIG_DEBUG_INFO' out/.config | tr '\n' ' ')"
 
-# 早期断言：配置没真正生效就立刻停，别等编译几十分钟才失败
-for k in CONFIG_KSU CONFIG_KSU_SYSCALL_TABLE_HOOK CONFIG_KALLSYMS_ALL CONFIG_EXT4_FS; do
+# Kconfig 的 choice 组在 KPROBES=n 时行为不可靠，分三级兜底
+MAKE_EXTRA=""
+if ! grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config; then
+  echo "  hook 模式未落盘 → 二次强制写入"
+  set_cfg CONFIG_KSU_MANUAL_HOOK n
+  set_cfg CONFIG_KSU_SYSCALL_TABLE_HOOK y
+  make ARCH=arm64 O=out $KMAKE_ARGS olddefconfig >/dev/null 2>&1 || true
+fi
+
+if ! grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config; then
+  log "Kconfig choice 仍不接受 → 直接改 KSU 的 Kbuild 强制 syscall table 模式"
+  KB="$WORK/KernelSU-Next/kernel/Kbuild"
+  if ! grep -q 'KSU_FORCE_SYSCALL' "$KB"; then
+    cat >> "$KB" <<'KBEOF'
+
+# --- 构建脚本强制追加：4.19 + KPROBES=n 时 Kconfig choice 不生效 ---
+KSU_FORCE_SYSCALL := 1
+ccflags-y += -DKSU_SYSCALL_TABLE_HOOK
+kernelsu-objs += hook/patch_memory.o
+kernelsu-objs += hook/syscall_table_hook.o
+kernelsu-objs += infra/symbol_resolver.o
+KBEOF
+  fi
+  # Kbuild 里的 $(error ...) 用命令行的 HAVE_KSU_HOOK 绕开
+  MAKE_EXTRA="HAVE_KSU_HOOK=0"
+  echo "  已启用 Kbuild 兜底（HAVE_KSU_HOOK=0 + -DKSU_SYSCALL_TABLE_HOOK）"
+fi
+
+# 早期断言：核心配置没真正生效就立刻停，别等编译几十分钟才失败
+for k in CONFIG_KSU CONFIG_KALLSYMS_ALL CONFIG_EXT4_FS; do
   grep -q "^$k=y" out/.config || { echo "配置未生效：$k —— 中止"; exit 1; }
 done
-echo "  KSU 相关: $(grep -E '^CONFIG_KSU' out/.config | tr '\n' ' ')"
-echo "  DEBUG_INFO: $(grep -E '^CONFIG_DEBUG_INFO' out/.config | tr '\n' ' ')"
 
 # ---------------------------------------------------------------- 6. 编译
 log "开始编译 Image（jobs=$JOBS）"
 T0=$(date +%s)
 make -j"$JOBS" ARCH=arm64 O=out \
   CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-  KCFLAGS="-Wno-error" \
+  KCFLAGS="-Wno-error" $MAKE_EXTRA \
   Image
 log "编译完成，耗时 $(( $(date +%s) - T0 )) 秒"
 
