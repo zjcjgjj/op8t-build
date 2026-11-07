@@ -49,24 +49,35 @@ log "  HEAD $(git rev-parse --short HEAD)  $(git log -1 --format=%cd --date=shor
 # --------------------------------------------------------------- 2. 工具链
 log "===== 准备 clang 10 ====="
 TC="$WORK/tc"; mkdir -p "$TC"
-if [ ! -x "$TC/clang10/bin/clang" ]; then
-  if curl -fL --retry 3 --retry-delay 3 -o "$TC/clang10.tar.xz" \
-      "https://github.com/llvm/llvm-project/releases/download/llvmorg-10.0.1/clang%2Bllvm-10.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz"; then
-    tar -xf "$TC/clang10.tar.xz" -C "$TC" || true
+if ! "$TC/clang10/bin/clang" --version >/dev/null 2>&1; then
+  if [ ! -d "$TC/clang+llvm-10" ]; then
+    curl -fL --retry 3 --retry-delay 3 -o "$TC/clang10.tar.xz" \
+      "https://github.com/llvm/llvm-project/releases/download/llvmorg-10.0.1/clang%2Bllvm-10.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz" || true
+    tar -xf "$TC/clang10.tar.xz" -C "$TC" 2>/dev/null || true
     d=$(find "$TC" -maxdepth 1 -type d -name 'clang+llvm-10*' | head -1)
     [ -n "$d" ] && rm -rf "$TC/clang10" && mv "$d" "$TC/clang10"
   fi
+  # LLVM 10 的预编译包依赖 libtinfo5，Ubuntu 22.04 已移除 → 直接装 focal 的 deb
   if ! "$TC/clang10/bin/clang" --version >/dev/null 2>&1; then
-    log "  LLVM 官方包不可用，回退 AOSP prebuilt r383902"
+    log "  clang 无法运行，安装 libtinfo5"
+    for deb in \
+      http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.2-0ubuntu2.1_amd64.deb \
+      http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.2-0ubuntu2_amd64.deb; do
+      curl -fsSL --retry 3 -o "$TC/libtinfo5.deb" "$deb" || continue
+      sudo dpkg -i "$TC/libtinfo5.deb" >/dev/null 2>&1 && break
+    done
+  fi
+  if ! "$TC/clang10/bin/clang" --version >/dev/null 2>&1; then
+    log "  仍未跑起来，回退 AOSP prebuilt r416183b"
     rm -rf "$TC/prebuilt-clang"
     git clone --depth 1 -q \
-      https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r383902 \
+      https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b \
       "$TC/prebuilt-clang"
     rm -rf "$TC/clang10"; ln -sfn "$TC/prebuilt-clang" "$TC/clang10"
   fi
 fi
 export PATH="$TC/clang10/bin:$PATH"
-clang --version | head -2
+clang --version | head -2 || { echo "[FAIL] 工具链不可用"; exit 1; }
 
 # ------------------------------------------------------- 3. 可选 KernelSU 集成
 if [ "$PHASE" = "ksu" ]; then
