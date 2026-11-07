@@ -43,11 +43,21 @@ PAT = re.compile(r'^(\s*__crc_([A-Za-z0-9_]+)\s*=\s*)0[xX][0-9a-fA-F]+\s*;\s*$')
 
 def main():
     crc = load_stock()
+    # CRC_STAT_FILE：记录「genksyms 原值 != 原厂值」的符号。
+    # 这是本轮最关键的诊断量：空白对照内核若漂移很多，说明一加 OSS
+    # 源码树本身与原厂内核不同；若 KSU 阶段比对照阶段多出漂移，说明
+    # 官方 Kbuild 的自动 backport（struct seccomp / selinux）改动了 ABI。
+    stat = os.environ.get('CRC_STAT_FILE')
     hit = 0
     for line in sys.stdin:
         m = PAT.match(line)
         if m and m.group(2) in crc:
-            line = '%s0x%08x;\n' % (m.group(1), crc[m.group(2)])
+            want = crc[m.group(2)]
+            had = int(m.group(0).split('=')[1].strip().rstrip(';'), 16)
+            if had != want and stat:
+                with open(stat, 'a', encoding='utf-8') as f:
+                    f.write('%s 0x%08x 0x%08x\n' % (m.group(2), had, want))
+            line = '%s0x%08x;\n' % (m.group(1), want)
             hit += 1
         sys.stdout.write(line)
     # 只在确有覆盖时打印，避免几千条噪音；输出到 stderr 会进 build.log
