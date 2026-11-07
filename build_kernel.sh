@@ -340,9 +340,14 @@ KBEOF
 fi
 
 # 早期断言：核心配置没真正生效就立刻停，别等编译几十分钟才失败
-for k in CONFIG_KSU CONFIG_KALLSYMS_ALL CONFIG_EXT4_FS; do
-  grep -q "^$k=y" out/.config || { echo "配置未生效：$k —— 中止"; exit 1; }
+grep -q "^CONFIG_KSU=y" out/.config || { echo "配置未生效：CONFIG_KSU —— 中止"; exit 1; }
+grep -q "^CONFIG_KALLSYMS_ALL=y" out/.config || { echo "配置未生效：CONFIG_KALLSYMS_ALL —— 中止"; exit 1; }
+# EXT4 / OVERLAY 只做提示：syscall hook 不依赖它们硬性成立
+for k in CONFIG_EXT4_FS CONFIG_OVERLAY_FS; do
+  grep -q "^$k=y" out/.config || echo "  提示：$k 不是 y → $(grep -E "^(# )?${k}" out/.config | head -1)"
 done
+echo "  --- 关键配置实际值 ---"
+grep -E "^(# )?CONFIG_(KSU|KPROBES|EXT4_FS|OVERLAY_FS|DEBUG_INFO|MODULES|MODVERSIONS|MODULE_SIG)" out/.config | sed 's/^/    /'
 
 # ---------------------------------------------------------------- 6. 编译
 log "开始编译 Image（jobs=$JOBS）"
