@@ -1,0 +1,103 @@
+name: Patch stock kernel with KernelPatch (OnePlus 8T)
+
+# 思路（与 Magisk 打补丁一致）：不重新编译内核、不替换内核本体，
+# 只在原厂裸 ARM64 Image 里用 KernelPatch 注入一小段 hook 代码。
+# 产物是"修补后的 kernel"，boot 重打包在本地做（保留官方签名 AVB0/AVBf）。
+on:
+  workflow_dispatch:
+    inputs:
+      kp_version:
+        description: 'KernelPatch release tag'
+        required: false
+        default: '0.13.9'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patch-kp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 还原官方裸内核
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          gzip -dc kp/stock_kernel_Image.gz > work/kernel
+          ls -lh work/kernel
+          python3 - <<'PY'
+          d = open('work/kernel', 'rb').read()
+          assert d[56:60] == b'ARMd', '不是 ARM64 裸 Image'
+          assert d[:2] != b'\x1f\x8b', '内核仍是压缩格式'
+          print('ARM64 raw Image OK:', len(d), 'bytes')
+          print('IKCFG_ST @', d.find(b'IKCFG_ST'))
+          print('Linux version @', d.find(b'Linux version'))
+          PY
+
+      - name: 生成 SuperKey（不写进日志）
+        run: |
+          set -euo pipefail
+          KEY=$(python3 -c 'import secrets,string; print("Kp" + "".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(22)))')
+          echo "::add-mask::$KEY"
+          printf '%s\n' "$KEY" > work/superkey.txt
+          echo "SuperKey 已生成（$(wc -c < work/superkey.txt) 字节，日志中已掩码）"
+
+      - name: 下载 KernelPatch 工具
+        run: |
+          set -euo pipefail
+          V='${{ inputs.kp_version }}'
+          B="https://github.com/bmax121/KernelPatch/releases/download/$V"
+          curl -fSL --retry 3 -o work/kptools "$B/kptools-linux"
+          curl -fSL --retry 3 -o work/kpimg   "$B/kpimg-android"
+          chmod +x work/kptools
+          ls -lh work/kptools work/kpimg
+          ./work/kptools -v 2>&1 | head -5 || true
+
+      - name: 校验原厂内核符号可解析（决定性前置检查）
+        run: |
+          set -o pipefail
+          ./work/kptools -d -i work/kernel 2>&1 | tee work/dump_symbols.log | head -60
+          echo "--- ikconfig ---"
+          ./work/kptools -f -i work/kernel 2>&1 | tee work/dump_ikconfig.log | head -25 || true
+          echo "--- 关键符号 ---"
+          grep -iE "sys_call_table|kallsyms|paging_init|rest_init" work/dump_symbols.log | head -12 || true
+
+      - name: 注入 KernelPatch
+        run: |
+          set -euo pipefail
+          KEY=$(cat work/superkey.txt)
+          cd work
+          ./kptools -p -i kernel -s "$KEY" -k kpimg -o kernel_patched 2>&1 | tee patch.log
+          echo "--- 补丁信息 ---"
+          ./kptools -l -i kernel_patched 2>&1 | tee list.log | head -60 || true
+          python3 - <<'PY'
+          a = open('kernel', 'rb').read()
+          b = open('kernel_patched', 'rb').read()
+          print('before %d B, after %d B, delta %+d B' % (len(a), len(b), len(b)-len(a)))
+          assert len(b) >= len(a), '输出比输入还小，修补异常'
+          assert b[56:60] == b'ARMd', '输出不是 ARM64 Image'
+          # 统计差异，确认只改了少量字节 + 尾部追加
+          diff = sum(1 for x, y in zip(a, b) if x != y)
+          print('前 %d 字节内差异: %d (%.4f%%)' % (len(a), diff, 100.0*diff/len(a)))
+          assert diff < len(a) * 0.02, '改动超过 2%%，不像正常注入，中止'
+          PY
+
+      - name: 上传修补后的内核
+        uses: actions/upload-artifact@v4
+        with:
+          name: kp-kernel
+          path: |
+            work/kernel_patched
+            work/superkey.txt
+            work/patch.log
+            work/list.log
+            work/dump_symbols.log
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
