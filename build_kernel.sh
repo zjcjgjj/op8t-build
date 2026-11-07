@@ -504,6 +504,20 @@ fi
 
 log "打开 KernelSU 相关选项 / 处理厂商模块兼容性"
 CFG="out/.config"
+
+# 可选：以「从原厂内核 IKCONFIG 段解出的完整 .config」为基线，
+# 把 5533 项配置逐项对齐原厂，只叠加 KSU 补丁。用于彻底消除
+# vendor 模块的符号 CRC 失配（若开 MODVERSIONS 后仍报
+# "disagrees about version of symbol ..." 再启用）。
+# 默认 0：现有 defconfig 链路已验证能编译通过，先只修 vermagic 这一项。
+# 启用方式：workflow_dispatch 传 use_stock_config=1，或 USE_STOCK_CONFIG=1 ./build_kernel.sh
+STOCK_CFG="${STOCK_CFG:-$HERE/stock_config.txt}"
+if [ "${USE_STOCK_CONFIG:-0}" = "1" ]; then
+  [ -f "$STOCK_CFG" ] || { echo "找不到原厂配置基线: $STOCK_CFG"; exit 1; }
+  log "使用原厂 IKCONFIG 配置基线: $STOCK_CFG"
+  cp "$STOCK_CFG" "$CFG"
+fi
+
 # 先删旧行再写，避免出现重复键（.config 里 "X=y" 与 "# X is not set" 并存会被 Kconfig 警告）
 set_cfg() {
   local k="$1" v="$2"
@@ -524,11 +538,20 @@ set_cfg CONFIG_OVERLAY_FS y
 #    改用 syscall table hook（作者注明面向 non-GKI，要求内核 >= 4.17）
 set_cfg CONFIG_KSU_MANUAL_HOOK n
 set_cfg CONFIG_KSU_SYSCALL_TABLE_HOOK y
-# ↓↓ 关键：关闭厂商模块签名强制与符号版本校验，
-#    否则原厂 vendor 分区里的已签名模块（wlan/camera/audio）会拒绝加载
+# ↓↓ 关键：CONFIG_MODVERSIONS 必须与原厂保持一致 = y。
+#    这是「换内核就进 recovery、Magisk 只补 ramdisk（原厂内核不变）却能进系统」的根因。
+#    原厂 IKCONFIG: CONFIG_MODVERSIONS=y / MODULE_SIG=y / MODULE_SIG_FORCE=y
+#    vermagic 原厂 = "4.19.157-perf+ SMP preempt mod_unload modversions aarch64"
+#    若编出的内核少了 "modversions"，内核 same_magic() 会拒绝加载
+#    vendor 分区里所有 .ko（显示/触控/wlan/相机/音频），Android init 起不来
+#    → bootloader 判定启动失败 → 自动回退 recovery。
+#    MODULE_SIG / MODULE_SIG_FORCE 不参与 vermagic 计算：
+#    OSS 源码树内置的 certs/signing_key.pem 与原厂 OEM 公钥不同，
+#    保留 FORCE=y 会让原厂签名模块验签失败，所以这两项继续关掉。
+set_cfg CONFIG_MODVERSIONS y
 set_cfg CONFIG_MODULE_SIG_FORCE n
 set_cfg CONFIG_MODULE_SIG n
-set_cfg CONFIG_MODVERSIONS n
+set_cfg CONFIG_MODULE_SIG_ALL n
 # ↓↓ 提速：调试信息不进 Image，却占掉整个编译时间的一大半（clang 生成 DWARF 极慢）
 set_cfg CONFIG_DEBUG_INFO n
 set_cfg CONFIG_DEBUG_INFO_REDUCED n
@@ -596,6 +619,28 @@ done
 echo "  --- 关键配置实际值 ---"
 grep -E "^(# )?CONFIG_(KSU|KPROBES|EXT4_FS|OVERLAY_FS|DEBUG_INFO|MODULES|MODVERSIONS|MODULE_SIG)" out/.config | sed 's/^/    /'
 
+# 诊断：与原厂 IKCONFIG 基线的差异数。差异越少，vendor 模块符号 CRC 越可能匹配。
+if [ -f "$STOCK_CFG" ]; then
+python3 - "$STOCK_CFG" "$CFG" <<'PYEOF'
+import sys
+def load(p):
+    d = {}
+    for l in open(p, encoding='utf-8', errors='replace'):
+        l = l.strip()
+        if l.startswith('CONFIG_') and '=' in l:
+            k, v = l.split('=', 1); d[k] = v
+        elif l.startswith('# CONFIG_') and ' is not set' in l:
+            d[l.split()[1]] = 'n'
+    return d
+s, b = load(sys.argv[1]), load(sys.argv[2])
+keys = set(s) | set(b)
+diff = [k for k in keys if s.get(k, '<缺>') != b.get(k, '<缺>')]
+print('  与原厂 config 差异项: %d / %d' % (len(diff), len(keys)))
+for k in ['CONFIG_MODVERSIONS', 'CONFIG_MODULE_SIG', 'CONFIG_MODULE_SIG_FORCE']:
+    print('    %-30s 原厂=%-4s 本次=%s' % (k, s.get(k, '<缺>'), b.get(k, '<缺>')))
+PYEOF
+fi
+
 # ---------------------------------------------------------------- 6. 编译
 log "开始编译 Image（jobs=$JOBS）"
 # ccache：失败重跑时绝大多数 .o 直接命中缓存，编译从十几分钟降到 1-3 分钟。
@@ -622,6 +667,26 @@ IMG="out/arch/arm64/boot/Image"
 ls -lh "$IMG"
 grep -a -o "Linux version 4\.19\.[0-9]*-perf[^\"]\{0,40\}" "$IMG" | head -1 || true
 
+# ------------------------------------------------- 6.5 vermagic 硬断言（能否开机的门槛）
+# 不等刷机再发现：编译产物里必须带 "modversions"，否则 vendor 模块全拒载。
+# 原厂串可从 stock_config.txt / 原厂内核 IKCONFIG 复核。
+python3 - "$IMG" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+d = open(p, 'rb').read()
+WANT = b'4.19.157-perf+ SMP preempt mod_unload modversions aarch64'
+hits = sorted(set(re.findall(rb'4\.19\.[0-9]+-perf\+ SMP [ -~]{0,90}', d)))
+print('  vermagic 候选:')
+for h in hits[:6]:
+    print('    ' + h.decode('ascii', 'replace'))
+if WANT not in d:
+    print('!! 中止：vermagic 缺 "modversions"。')
+    print('   这会让原厂 vendor 分区所有 .ko 加载失败，刷入必定回退 recovery。')
+    print('   检查 CONFIG_MODVERSIONS 是否被 olddefconfig 改回了 n。')
+    sys.exit(1)
+print('  vermagic 校验通过：与原厂一致，vendor 模块可加载')
+PYEOF
+
 # ---------------------------------------------------------------- 7. 打包 boot.img
 if [ -f "$STOCK_BOOT" ]; then
   log "替换原厂 boot.img 中的内核并重新打包"
@@ -638,17 +703,21 @@ else
 fi
 
 # ---------------------------------------------------------------- 8. 卡刷 zip
-log "生成关闭 AVB 的 vbmeta 与卡刷 zip"
-python3 "$HERE/vbmeta_patch.py" "$HERE/stock_vbmeta.img" "$HERE/vbmeta_avb_disabled.img"
+log "生成卡刷 zip（vbmeta 保持官方原厂，绝不修改）"
+# 真机实测：任何改动过的 vbmeta（改 flags / 清空 descriptor / 空 vbmeta）
+# 或 fastboot --disable-verity --disable-verification，都会让开机自动回退 recovery。
+# 官方原厂 vbmeta + Magisk 修补 boot 可以正常进系统，所以这里只放官方 vbmeta。
 ZIP="$HERE/OP8T_KernelSU-Next_${KSU_VER}.zip"
 python3 "$HERE/make_flash_zip.py" \
   --boot "$HERE/boot_kernelsu_next.img" \
-  --vbmeta "$HERE/vbmeta_avb_disabled.img" \
+  --vbmeta "$HERE/stock_vbmeta.img" \
   --name "OP8T_KernelSU-Next_${KSU_VER}" \
   --out "$ZIP" \
   --readme "
-内核: Linux 4.19.157 + KernelSU-Next ${KSU_VER}
+内核: Linux 4.19.157-perf+ + KernelSU-Next ${KSU_VER}
 基线: KB2000_14.0.0.602(CN01)
+CONFIG_MODVERSIONS=y 已与原厂对齐，vermagic 含 modversions。
+vbmeta.img = 官方原厂镜像（非禁用版），请勿改动 vbmeta 分区。
 "
 
 log "卡刷包 → $ZIP"
@@ -657,11 +726,13 @@ cat <<'EOF'
 刷入（任选其一）：
   A. recovery：安装 OP8T_KernelSU-Next_*.zip
   B. fastboot：
-     fastboot flash boot boot_kernelsu_next.img
-     fastboot flash vbmeta vbmeta_avb_disabled.img
+     fastboot flash boot_a boot_kernelsu_next.img
+     fastboot flash boot_b boot_kernelsu_next.img
      fastboot reboot
 
+vbmeta 分区保持官方原厂，不要刷禁用版，也不要带 --disable-verity。
 回滚到原厂：
-  fastboot flash boot stock_boot_KB2000_14.0.0.602.img
+  fastboot flash boot_a stock_boot_KB2000_14.0.0.602.img
+  fastboot flash boot_b stock_boot_KB2000_14.0.0.602.img
   fastboot flash vbmeta stock_vbmeta.img
 EOF

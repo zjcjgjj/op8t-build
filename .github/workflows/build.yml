@@ -11,6 +11,10 @@ on:
         description: '并行编译数（留空=自动 nproc）'
         required: false
         default: ''
+      use_stock_config:
+        description: '1=以原厂 IKCONFIG (stock_config.txt) 为配置基线，用于消除 vendor 模块 CRC 失配'
+        required: false
+        default: '0'
 
 permissions:
   contents: read
@@ -76,6 +80,7 @@ jobs:
         env:
           KSU_TAG: ${{ inputs.ksu_tag }}
           JOBS: ${{ inputs.jobs }}
+          USE_STOCK_CONFIG: ${{ inputs.use_stock_config }}
           WORK: ${{ runner.temp }}/kbuild
         run: |
           set -o pipefail   # 否则脚本失败会被 tee 的退出码掩盖
@@ -83,6 +88,11 @@ jobs:
           date +%s > .start
           ./build_kernel.sh 2>&1 | tee build.log
           echo "耗时: $(( $(date +%s) - $(cat .start) )) 秒"
+
+      - name: 校验 vermagic（vender 模块能否加载的硬门槛）
+        if: success()
+        run: |
+          python3 check_kernel.py kernel_Image
 
       - name: 保存 ccache（失败也保存，供下次重跑复用）
         if: always()
