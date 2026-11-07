@@ -162,6 +162,36 @@ cd "$WORK/KernelSU-Next"
 KSU_VER="$(git describe --tags --abbrev=0 2>/dev/null || echo "$KSU_TAG")"
 log "KernelSU-Next 版本: $KSU_VER"
 
+# 4.19 没有 strscpy_pad（v5.2 才进主线，只被 backport 到 Android 4.14 分支），
+# 但 KernelSU-Next legacy 在 compat/kernel_compat.h、policy/allowlist.c 里直接用了它，
+# 且其 __strscpy_pad 用 4.14.222 作分界，4.19.157 会误判成"内核已有实现"。
+# 这里只给 drivers/kernelsu 的编译单元注入兼容实现，不污染内核其余部分。
+COMPAT_H="$WORK/kernel/include/linux/ksu_419_compat.h"
+mkdir -p "$(dirname "$COMPAT_H")"
+cat > "$COMPAT_H" <<'HEOF'
+#ifndef _KSU_419_COMPAT_H
+#define _KSU_419_COMPAT_H
+#include <linux/version.h>
+#include <linux/string.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
+#ifndef strscpy_pad
+static inline ssize_t strscpy_pad(char *dest, const char *src, size_t count)
+{
+	ssize_t ret = strscpy(dest, src, count);
+	if (ret >= 0 && (size_t)ret < count)
+		memset(dest + ret, 0, count - ret);
+	return ret;
+}
+#endif
+#endif
+#endif
+HEOF
+KSU_KB="$WORK/KernelSU-Next/kernel/Kbuild"
+if ! grep -q 'ksu_419_compat.h' "$KSU_KB"; then
+  printf '\nccflags-y += -include %s\n' "$COMPAT_H" >> "$KSU_KB"
+  log "已为 KernelSU 注入 4.19 的 strscpy_pad 兼容实现"
+fi
+
 # ---------------------------------------------------------------- 4. 集成到驱动树
 cd "$WORK/kernel/drivers"
 log "把 KernelSU-Next 挂进 drivers/（等价于官方 setup.sh）"
