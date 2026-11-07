@@ -20,7 +20,8 @@ concurrency:
 
 jobs:
   patch:
-    runs-on: ubuntu-22.04
+    # kptools-linux 0.13.9 需要 GLIBC_2.38；22.04 只有 2.35，必须用 24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -61,21 +62,27 @@ jobs:
 
       - name: 校验原厂内核符号可解析（决定性前置检查）
         run: |
-          set -o pipefail
-          ./work/kptools -d -i work/kernel 2>&1 | tee work/dump_symbols.log | head -60
+          set -euo pipefail
+          ./work/kptools -d -i work/kernel > work/dump_symbols.log 2>&1 || true
+          head -40 work/dump_symbols.log
           echo "--- ikconfig ---"
-          ./work/kptools -f -i work/kernel 2>&1 | tee work/dump_ikconfig.log | head -25 || true
+          ./work/kptools -f -i work/kernel > work/dump_ikconfig.log 2>&1 || true
+          head -20 work/dump_ikconfig.log
           echo "--- 关键符号 ---"
           grep -iE "sys_call_table|kallsyms|paging_init|rest_init" work/dump_symbols.log | head -12 || true
+          echo "--- 符号表行数 ---"
+          wc -l work/dump_symbols.log
 
       - name: 注入 KernelPatch
         run: |
           set -euo pipefail
           KEY=$(cat work/superkey.txt)
           cd work
-          ./kptools -p -i kernel -s "$KEY" -k kpimg -o kernel_patched 2>&1 | tee patch.log
+          ./kptools -p -i kernel -s "$KEY" -k kpimg -o kernel_patched > patch.log 2>&1
+          cat patch.log
           echo "--- 补丁信息 ---"
-          ./kptools -l -i kernel_patched 2>&1 | tee list.log | head -60 || true
+          ./kptools -l -i kernel_patched > list.log 2>&1 || true
+          head -60 list.log
           python3 - <<'PY'
           a = open('kernel', 'rb').read()
           b = open('kernel_patched', 'rb').read()
