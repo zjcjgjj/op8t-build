@@ -115,12 +115,29 @@ ls -l kernel/sched_assist block/blk include/linux/sched_assist | sed 's/^/    /'
 #   #include "../../../../kernel/msm-4.19/drivers/power/supply/qcom/storm-watch.h"
 # 合并后的树里 kernel/msm-4.19 其实就是源码根本身，层级对不上。
 # 统一改成源码根绝对路径，一次覆盖所有这类引用。
-log "规范化 kernel/msm-4.19 跨树 include"
+log "规范化私有模块的跨树 include"
 python3 - <<'PYEOF'
 import os, re
 ROOT = os.getcwd()
-PAT = re.compile(r'(#\s*include\s*)["<](?:\.\./)+kernel/msm-4\.19/([^">]+)[">]')
-changed, missing = 0, []
+PAT_AOSP = re.compile(r'(#\s*include\s*)["<](?:\.\./)+kernel/msm-4\.19/([^">]+)[">]')
+INC_REL = re.compile(r'(#\s*include\s*)"([^"]+)"')
+cnt = {'aosp': 0, 'rel': 0}
+changed = 0
+
+# 头文件后缀 -> 绝对路径 索引（如 "dsi/dsi_display.h" ->
+# <root>/techpack/display/msm/dsi/dsi_display.h）
+hdr_idx = {}
+for base, dirs, files in os.walk(ROOT):
+    if '.git' in dirs:
+        dirs.remove('.git')
+    for f in files:
+        if not f.endswith('.h'):
+            continue
+        h = os.path.join(base, f).replace('\\', '/')
+        parts = os.path.relpath(h, ROOT).replace('\\', '/').split('/')
+        for i in range(len(parts)):
+            hdr_idx.setdefault('/'.join(parts[i:]), h)
+
 for base, dirs, files in os.walk(ROOT):
     if '.git' in dirs:
         dirs.remove('.git')
@@ -132,20 +149,38 @@ for base, dirs, files in os.walk(ROOT):
             t = open(p, encoding='utf-8', errors='replace').read()
         except OSError:
             continue
-        if 'kernel/msm-4.19' not in t:
+        if '#include' not in t:
             continue
-        def rep(m):
-            return m.group(1) + '"' + os.path.join(ROOT, m.group(2)) + '"'
-        new = PAT.sub(rep, t)
+
+        def rep_aosp(m):
+            cnt['aosp'] += 1
+            return m.group(1) + '"' + os.path.join(ROOT, m.group(2)).replace('\\', '/') + '"'
+
+        STD_PREFIX = ('linux/', 'asm/', 'uapi/', 'dt-bindings/', 'generated/',
+                      'trace/', 'soc/', 'net/', 'crypto/', 'sound/', 'video/')
+
+        def rep_rel(m):
+            inc = m.group(2)
+            if '/' not in inc or inc.startswith('/') or inc.startswith(STD_PREFIX):
+                return m.group(0)
+            # 常规搜索路径已经能找到 -> 不动，避免误改
+            if (os.path.isfile(os.path.join(ROOT, inc)) or
+                os.path.isfile(os.path.join(ROOT, 'include', inc)) or
+                os.path.isfile(os.path.join(os.path.dirname(p), inc))):
+                return m.group(0)
+            target = hdr_idx.get(inc)
+            if target and os.path.isfile(target):
+                cnt['rel'] += 1
+                return m.group(1) + '"' + target + '"'
+            return m.group(0)
+
+        new = INC_REL.sub(rep_rel, PAT_AOSP.sub(rep_aosp, t))
         if new != t:
             open(p, 'w', encoding='utf-8').write(new)
             changed += 1
-            for m in PAT.finditer(t):
-                if not os.path.isfile(os.path.join(ROOT, m.group(2))):
-                    missing.append(m.group(2))
-print('  规范化 %d 个文件中的跨树 include' % changed)
-for x in missing[:8]:
-    print('  WARN 目标不存在:', x)
+print('  AOSP 跨树 include 修正: %d 处' % cnt['aosp'])
+print('  相对 include 改绝对路径: %d 处' % cnt['rel'])
+print('  共改动 %d 个文件' % changed)
 PYEOF
 
 # ---------------------------------------------------------------- 2. 工具链
