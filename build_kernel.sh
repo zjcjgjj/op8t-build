@@ -280,13 +280,20 @@ cat > drivers/ksu_compat_stubs.c <<'CEOF'
 static char ksu_fake_display[4096];
 __attribute__((weak)) void *get_main_display(void) { return ksu_fake_display; }
 
+/* oplus_router_boost_handler 是【函数指针变量】，不是函数。
+ * net/ipv4/tcp_ipv4.c 与 udp.c 用 8 字节 ldr 读它，对应重定位
+ * R_AARCH64_LDST64_ABS_LO12_NC 要求符号 8 字节对齐。若按函数打桩，
+ * 符号落在 .text 只有 4 字节对齐 → ld.lld 报 improper alignment /
+ * GNU ld 报 relocation truncated；运行时还会把指令码当成函数指针调用。
+ * 这里定义成 weak 的 8 字节指针、值为 NULL，调用方会自然跳过该增强。 */
+__attribute__((weak, aligned(8))) void *oplus_router_boost_handler;
+
 KSU_WEAK_STUB(create_signal_quality_proc)
 KSU_WEAK_STUB(dsi_panel_need_rewrite_reg)
 KSU_WEAK_STUB(io_latency_hist_show)
 KSU_WEAK_STUB(is_reclaim_should_cancel)
 KSU_WEAK_STUB(msm_drm_register_client)
 KSU_WEAK_STUB(msm_drm_unregister_client)
-KSU_WEAK_STUB(oplus_router_boost_handler)
 KSU_WEAK_STUB(path_umount)
 KSU_WEAK_STUB(recordUniproErr)
 KSU_WEAK_STUB(register_lcdinfo_notifier)
